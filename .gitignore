@@ -28,3 +28,5 @@ Thumbs.db
 wandb
 hico_20160224_det
 checkpoints
+runs/
+logs/
