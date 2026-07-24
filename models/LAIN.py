@@ -519,11 +519,11 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
         if dist.get_rank() == 0:
             print(f"Load weights for the object detector from {args.pretrained}")
         if 'e632da11' in args.pretrained:
-            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model']) 
+            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu', weights_only=False)['model']) 
         else:
-            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu')['model_state_dict'])
+            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu', weights_only=False)['model_state_dict'])
     
-    clip_state_dict = torch.load(clip_model_path, map_location="cpu").state_dict()
+    clip_state_dict = torch.load(clip_model_path, map_location="cpu", weights_only=False).state_dict()
     clip_model = build_model(state_dict=clip_state_dict, use_adapter=args.use_insadapter, adapter_pos=args.adapter_pos, args=args)
 
     if args.num_classes == 117:
