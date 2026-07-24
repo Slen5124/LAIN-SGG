@@ -300,7 +300,7 @@ class LAIN(nn.Module):
         alpha=self.alpha, gamma=self.gamma
         )
 
-        return loss / n_p
+        return loss / max(n_p, 1)
 
     def prepare_region_proposals(self, results): ## √ detr extracts the human-object pairs
         region_props = []

@@ -26,6 +26,7 @@ from utils.hico_text_label import hico_unseen_index
 warnings.filterwarnings("ignore")
 
 def main(rank, args):
+    torch.autograd.set_detect_anomaly(True)
     dist.init_process_group(
         backend="nccl",
         init_method="env://",
@@ -56,6 +57,9 @@ def main(rank, args):
     class _Debug20(type(trainset)):
         def __len__(self): return 20
     trainset.__class__ = _Debug20
+    class _DebugTest20(type(testset)):
+        def __len__(self): return 20
+    testset.__class__ = _DebugTest20
     print(f'[DEBUG] trainset len -> {len(trainset)}')
 
     # if args.dataset == 'vcoco':
