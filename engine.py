@@ -98,7 +98,6 @@ class CustomisedDLE(DistributedLearningEngine):
             loss_dict = self._state.net(
                 *self._state.inputs, targets=self._state.targets)
         if loss_dict['interaction_loss'].isnan():
-            breakpoint()
             raise ValueError(f"The HOI loss is NaN for rank {self._rank}")
 
         if self.args.amp:
