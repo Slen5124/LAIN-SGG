@@ -94,7 +94,7 @@
   "debug": true,
   "seed": 66,
   "device": "cuda",
-  "port": "29513",
+  "port": "29521",
   "print_interval": 2,
   "world_size": 1,
   "local_rank": 0,

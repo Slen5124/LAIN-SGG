@@ -405,7 +405,6 @@ class LAIN(nn.Module):
         images: List[Tensor],
         targets: Optional[List[dict]] = None
     ) -> List[dict]:
-        breakpoint()
 
         if self.training and targets is None:
             raise ValueError("In training mode, targets should be passed")

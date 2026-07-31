@@ -89,12 +89,12 @@ class LAINadapter(nn.Module):
         #locality adapter
         im_tokens_down = self.alpha * im_tokens_down.view(14, 14, -1,self.down_dim).permute(2, 3, 0, 1) + prior.unsqueeze(0).permute(0, 3, 1, 2)
         im_tokens_down = self.down_proj6(self.ln3(im_tokens_down.permute(0, 2, 3, 1))).permute(0, 3, 1, 2)
-
+        # 33,55 컨볼루션 후에 컨캣
         im_tokens_map = self.ln2(
             self.non_linear_func(self.down_proj4(im_tokens_down) + self.down_proj5(im_tokens_down)).permute(0, 2, 3, 1))
         im_tokens_up = self.up_proj2(im_tokens_map).flatten(1, 2).permute(1, 0, 2)
         im_tokens_output = im_tokens_up * self.scale2
-
+        # LA 두 컨볼루션 결과 이어붙이기 
         #interaction adapter
         la_im_tokens = im_tokens + im_tokens_output
 
@@ -110,10 +110,10 @@ class LAINadapter(nn.Module):
 
 
         object_pid = object_pid.tolist()
-        object_pid.append(-1)
+        object_pid.append(-1) 
         human_pid = human_pid.tolist()
         human_pid.append(-1)
-
+        # IA 핵심
         context_tokens = self.prompt.weight.unsqueeze(1).repeat(1, object_feats.size(0), 1)
         for z, layer in enumerate(self.mhsa_layers):
             context_tokens = layer(context_tokens, object_feats.permute(1, 0, 2), tgt_mask=None,
