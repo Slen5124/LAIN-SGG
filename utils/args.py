@@ -10,6 +10,15 @@ def get_args():
     parser.add_argument('--dilation', action='store_true')
     parser.add_argument('--amp', action='store_true')
     parser.add_argument('--position-embedding', default='sine', type=str, choices=('sine', 'learned'))
+    parser.add_argument('--vg-prompt-format', default='person', choices=[
+            'person',
+            'something',
+            'bare',
+        ],
+        help=(
+            'Prompt template for VG predicates. '
+            'person preserves the original HOI assumption; '
+            'something and bare are ablations.'),) # VG용 실험조건 생성
 
 
     parser.add_argument('--repr-dim', default=512, type=int)

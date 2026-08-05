@@ -263,11 +263,10 @@ class LAIN(nn.Module):
         # print("pair gt,",len(x),len(y))
         # IndexError: tensors used as indices must be long, byte or bool tensors
 
-        if self.num_classes == 117 or self.num_classes == 24 or self.num_classes == 407:
-            labels[x, targets['labels'][y]] = 1  ## target['labels']: verb/action
+        if self.num_classes in [24, 50, 117, 407]:
+            labels[x, targets['labels'][y]] = 1
         else:
             labels[x, targets['hoi'][y]] = 1
-        # print("#(labels==1) = ", torch.sum(labels))
         return labels
 
     def compute_interaction_loss(self, boxes, bh, bo, logits, prior, targets): ### loss
@@ -528,12 +527,35 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
 
     if args.num_classes == 117:
         classnames = hico_verbs_sentence
+
     elif args.num_classes == 24:
         classnames = vcoco_verbs_sentence
+
     elif args.num_classes == 600:
-        classnames = list(hico_text_label.hico_text_label.values())
+        classnames = list(
+            hico_text_label.hico_text_label.values()
+        )
+
+    elif args.dataset == 'vg' and args.num_classes == 50:
+        from utils.vg_list import get_vg_predicates
+
+        classnames = get_vg_predicates(
+            args.vg_prompt_format
+        )
+
     else:
-        raise NotImplementedError
+        raise NotImplementedError(
+            'Unsupported dataset/class configuration: '
+            f'dataset={args.dataset}, '
+            f'num_classes={args.num_classes}'
+        )
+
+    if len(classnames) != args.num_classes:
+        raise ValueError(
+            'Relation classname count mismatch: '
+            f'{len(classnames)} classnames versus '
+            f'num_classes={args.num_classes}.'
+        )
 
     model = CustomCLIP(args, classnames=classnames, clip_model=clip_model)
 
