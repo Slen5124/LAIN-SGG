@@ -52,8 +52,13 @@ def main(rank, args):
     trainset = DataFactory(name=args.dataset, partition=args.partitions[0], data_root=args.data_root,
                            clip_model_name=args.clip_model_name, zero_shot=args.zs, zs_type=args.zs_type,
                            num_classes=args.num_classes, args=args)
-    testset = DataFactory(name=args.dataset, partition=args.partitions[1], data_root=args.data_root,
-                          clip_model_name=args.clip_model_name, args=args)
+    testset = DataFactory(name=args.dataset,
+                            partition=args.partitions[1],
+                            data_root=args.data_root,
+                            clip_model_name=args.clip_model_name,
+                            num_classes=args.num_classes,
+                            args=args,)
+
     class _Debug20(type(trainset)):
         def __len__(self): return 20
     trainset.__class__ = _Debug20

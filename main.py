@@ -51,8 +51,12 @@ def main(rank, args):
     trainset = DataFactory(name=args.dataset, partition=args.partitions[0], data_root=args.data_root,
                            clip_model_name=args.clip_model_name, zero_shot=args.zs, zs_type=args.zs_type,
                            num_classes=args.num_classes, args=args)
-    testset = DataFactory(name=args.dataset, partition=args.partitions[1], data_root=args.data_root,
-                          clip_model_name=args.clip_model_name, args=args)
+    testset = DataFactory(name=args.dataset,
+                        partition=args.partitions[1],
+                        data_root=args.data_root,
+                        clip_model_name=args.clip_model_name,
+                        num_classes=args.num_classes,
+                        args=args,)
 
     # if args.dataset == 'vcoco':
     #     object_n_verb_to_interaction = vcoco_object_n_verb_to_interaction(num_object_cls=len(trainset.dataset.objects), num_action_cls=len(trainset.dataset.actions), class_corr=class_corr)
