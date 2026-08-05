@@ -187,6 +187,7 @@ class LAIN(nn.Module):
                 perm = torch.cat([h_idx, o_idx])
                 boxes = boxes[perm]; scores = scores[perm]
                 labels = labels[perm]
+                feats = feats[perm] # 추가된 코드
             # Skip image when there are no valid human-object pairs
             if n_h == 0 or n <= 1:
                 boxes_h_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
