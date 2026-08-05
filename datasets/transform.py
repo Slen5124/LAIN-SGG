@@ -18,89 +18,181 @@ def crop(image, target, region):
 
     target = target.copy()
     i, j, h, w = region
-
-    # should we do something wrt the original size?
     target["size"] = torch.tensor([h, w])
 
-    # fields = ["labels", "area"]
-    fields = ["labels", "object",]
+    # Relation-level fields must always receive the same keep mask as
+    # boxes_h and boxes_o.
+    relation_fields = [
+        field
+        for field in (
+            "labels",
+            "verb",
+            "hoi",
+            "subject",
+            "object",
+        )
+        if field in target
+    ]
 
-    ex_fields = ["ex_scores", "ex_labels", "ex_hidden_states"]
+    fields = list(relation_fields)
+    ex_fields = [
+        "ex_scores",
+        "ex_labels",
+        "ex_hidden_states",
+    ]
+
     if "boxes" in target:
         boxes = target["boxes"]
-        max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
-        cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
+        max_size = torch.as_tensor(
+            [w, h],
+            dtype=torch.float32,
+        )
+        offset = torch.as_tensor(
+            [j, i, j, i],
+            dtype=torch.float32,
+        )
+
+        cropped_boxes = boxes - offset
+        cropped_boxes = torch.min(
+            cropped_boxes.reshape(-1, 2, 2),
+            max_size,
+        )
         cropped_boxes = cropped_boxes.clamp(min=0)
-        area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
+
+        area = (
+            cropped_boxes[:, 1, :]
+            - cropped_boxes[:, 0, :]
+        ).prod(dim=1)
+
         target["boxes"] = cropped_boxes.reshape(-1, 4)
         target["area"] = area
         fields.append("boxes")
 
-    # Crop human and object boxes
     if "boxes_h" in target:
         boxes = target["boxes_h"]
-        max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
-        cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
+        max_size = torch.as_tensor(
+            [w, h],
+            dtype=torch.float32,
+        )
+        offset = torch.as_tensor(
+            [j, i, j, i],
+            dtype=torch.float32,
+        )
+
+        cropped_boxes = boxes - offset
+        cropped_boxes = torch.min(
+            cropped_boxes.reshape(-1, 2, 2),
+            max_size,
+        )
         cropped_boxes = cropped_boxes.clamp(min=0)
-        area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
+
         target["boxes_h"] = cropped_boxes.reshape(-1, 4)
         fields.append("boxes_h")
+
     if "boxes_o" in target:
         boxes = target["boxes_o"]
-        max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
-        cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
+        max_size = torch.as_tensor(
+            [w, h],
+            dtype=torch.float32,
+        )
+        offset = torch.as_tensor(
+            [j, i, j, i],
+            dtype=torch.float32,
+        )
+
+        cropped_boxes = boxes - offset
+        cropped_boxes = torch.min(
+            cropped_boxes.reshape(-1, 2, 2),
+            max_size,
+        )
         cropped_boxes = cropped_boxes.clamp(min=0)
-        area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
+
         target["boxes_o"] = cropped_boxes.reshape(-1, 4)
         fields.append("boxes_o")
 
-    if 'ex_bbox' in target:
+    if "ex_bbox" in target:
         boxes = target["ex_bbox"]
-        max_size = torch.as_tensor([w, h], dtype=torch.float32)
-        cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
-        cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
+        max_size = torch.as_tensor(
+            [w, h],
+            dtype=torch.float32,
+        )
+        offset = torch.as_tensor(
+            [j, i, j, i],
+            dtype=torch.float32,
+        )
+
+        cropped_boxes = boxes - offset
+        cropped_boxes = torch.min(
+            cropped_boxes.reshape(-1, 2, 2),
+            max_size,
+        )
         cropped_boxes = cropped_boxes.clamp(min=0)
-        area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
+
         target["ex_bbox"] = cropped_boxes.reshape(-1, 4)
         ex_fields.append("ex_bbox")
 
     if "masks" in target:
-        # FIXME should we update the area here if there are no boxes?
-        target['masks'] = target['masks'][:, i:i + h, j:j + w]
+        target["masks"] = target["masks"][
+            :,
+            i:i + h,
+            j:j + w,
+        ]
         fields.append("masks")
 
-    # remove elements for which the boxes or masks that have zero area
-    if "boxes" in target or "masks" in target or "boxes_h" in target or "boxes_o" in target or 'ex_bbox' in target:
-        # favor boxes selection when defining which elements to keep
-        # this is compatible with previous implementation
-        if "boxes" in target:
-            cropped_boxes = target['boxes'].reshape(-1, 2, 2)
-            keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
-        elif "masks" in target:
-            keep = target['masks'].flatten(1).any(1)
-        elif "boxes_h" in target and "boxes_o" in target:
-            cropped_bh = target['boxes_h'].reshape(-1, 2, 2)
-            cropped_bo = target['boxes_o'].reshape(-1, 2, 2)
-            keep = torch.logical_and(
-                torch.all(cropped_bh[:, 1, :] > cropped_bo[:, 0, :], dim=1),
-                torch.all(cropped_bo[:, 1, :] > cropped_bo[:, 0, :], dim=1)
-            )
+    keep = None
 
-        else:
-            pass
+    if "boxes" in target:
+        cropped_boxes = target["boxes"].reshape(-1, 2, 2)
+        keep = torch.all(
+            cropped_boxes[:, 1, :]
+            > cropped_boxes[:, 0, :],
+            dim=1,
+        )
 
+    elif "masks" in target:
+        keep = target["masks"].flatten(1).any(1)
+
+    elif "boxes_h" in target and "boxes_o" in target:
+        cropped_subject_boxes = target["boxes_h"].reshape(
+            -1,
+            2,
+            2,
+        )
+        cropped_object_boxes = target["boxes_o"].reshape(
+            -1,
+            2,
+            2,
+        )
+
+        valid_subject = torch.all(
+            cropped_subject_boxes[:, 1, :]
+            > cropped_subject_boxes[:, 0, :],
+            dim=1,
+        )
+        valid_object = torch.all(
+            cropped_object_boxes[:, 1, :]
+            > cropped_object_boxes[:, 0, :],
+            dim=1,
+        )
+
+        keep = valid_subject & valid_object
+
+    if keep is not None:
         for field in fields:
             target[field] = target[field][keep]
 
-        if 'ex_bbox' in target:
-            cropped_boxes = target['ex_bbox'].reshape(-1, 2, 2)
-            keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
-            # pdb.set_trace()
-            for field in ex_fields:
-                target[field] = target[field][keep]
+    if "ex_bbox" in target:
+        cropped_boxes = target["ex_bbox"].reshape(-1, 2, 2)
+        ex_keep = torch.all(
+            cropped_boxes[:, 1, :]
+            > cropped_boxes[:, 0, :],
+            dim=1,
+        )
+
+        for field in ex_fields:
+            if field in target:
+                target[field] = target[field][ex_keep]
+
     return cropped_image, target
 
 
