@@ -393,7 +393,136 @@ class LAIN(nn.Module):
 
         return region_props
 
+    def build_vg_prior_features(self, region_props, image_size):
+        """Build a sentinel-free 14x14 object-layout prior for VG."""
+        if len(region_props) != len(image_size):
+            raise ValueError(
+                "VG prior batch mismatch: "
+                f"proposals={len(region_props)}, "
+                f"image_sizes={len(image_size)}"
+            )
+
+        grid_size = 14
+        device = image_size.device
+        dtype = self.object_embedding.dtype
+
+        prior_features = torch.zeros(
+            (
+                len(region_props),
+                grid_size,
+                grid_size,
+                self.priors_initial_dim,
+            ),
+            dtype=dtype,
+            device=device,
+        )
+
+        image_height, image_width = image_size.unbind(-1)
+        scale_factors = torch.stack(
+            [
+                image_width,
+                image_height,
+                image_width,
+                image_height,
+            ],
+            dim=1,
+        )
+
+        for batch_index, props in enumerate(region_props):
+            boxes = props['boxes']
+            scores = props['scores']
+            labels = props['labels'].long()
+
+            if not (
+                len(boxes) == len(scores) == len(labels)
+            ):
+                raise ValueError(
+                    "VG proposal fields must have equal lengths"
+                )
+
+            if len(boxes) == 0:
+                continue
+
+            if labels.min().item() < 0 or labels.max().item() >= 150:
+                raise ValueError(
+                    "VG object labels must be in [0, 149], "
+                    f"got [{labels.min().item()}, "
+                    f"{labels.max().item()}]"
+                )
+
+            scaled_boxes = boxes * (
+                grid_size
+                / scale_factors[batch_index][None, :]
+            )
+            scaled_boxes = scaled_boxes.clamp(
+                min=0,
+                max=grid_size,
+            )
+
+            object_embeddings = self.object_embedding[
+                labels
+            ].to(dtype=dtype)
+
+            proposal_features = torch.cat(
+                [
+                    scores.to(dtype=dtype).unsqueeze(-1),
+                    scaled_boxes.to(dtype=dtype),
+                    object_embeddings,
+                ],
+                dim=-1,
+            )
+
+            if proposal_features.shape[-1] != self.priors_initial_dim:
+                raise ValueError(
+                    "VG prior feature dimension mismatch: "
+                    f"expected={self.priors_initial_dim}, "
+                    f"actual={proposal_features.shape[-1]}"
+                )
+
+            # Draw low-score proposals first so a higher-score proposal
+            # owns pixels in overlapping regions.
+            draw_order = scores.argsort(descending=False)
+
+            for proposal_index in draw_order.tolist():
+                x1, y1, x2, y2 = scaled_boxes[
+                    proposal_index
+                ]
+
+                x1 = int(torch.floor(x1).clamp(0, grid_size - 1).item())
+                y1 = int(torch.floor(y1).clamp(0, grid_size - 1).item())
+                x2 = int(torch.ceil(x2).clamp(1, grid_size).item())
+                y2 = int(torch.ceil(y2).clamp(1, grid_size).item())
+
+                x2 = max(x2, x1 + 1)
+                y2 = max(y2, y1 + 1)
+
+                prior_features[
+                    batch_index,
+                    y1:y2,
+                    x1:x2,
+                ] = proposal_features[proposal_index]
+
+        return prior_features
+
     def get_prior(self, region_props, image_size): ##  for adapter module training
+
+        if self.dataset == "vg":
+            prior_features = self.build_vg_prior_features(
+                region_props,
+                image_size,
+            )
+            occupied = prior_features.abs().sum(
+                dim=-1,
+                keepdim=True,
+            ) > 0
+
+            priors = self.priors_downproj(
+                prior_features
+            )
+
+            # Keep the background explicitly zero even when the MLP has
+            # learned bias terms.
+            return priors * occupied.to(priors.dtype)
 
         max_feat = self.priors_initial_dim
         max_length = max(rep['boxes'].shape[0] for rep in region_props)
