@@ -20,37 +20,6 @@ VG150_PREDICATES = [
 assert len(VG150_PREDICATES) == 50
 
 
-vg_predicates_person = [
-    f'a photo of a person is {predicate} the object'
-    for predicate in VG150_PREDICATES
-]
-
-vg_predicates_something = [
-    f'a photo of something {predicate} something'
-    for predicate in VG150_PREDICATES
-]
-
-vg_predicates_bare = list(VG150_PREDICATES)
-
-
-VG_PROMPT_FORMATS = {
-    'person': vg_predicates_person,
-    'something': vg_predicates_something,
-    'bare': vg_predicates_bare,
-}
-
-
-def get_vg_predicates(prompt_format='something'):
-    """Return the 50 VG predicates using the requested prompt format."""
-    if prompt_format not in VG_PROMPT_FORMATS:
-        raise ValueError(
-            f"Unknown VG prompt format '{prompt_format}'. "
-            f"Choose from {list(VG_PROMPT_FORMATS.keys())}"
-        )
-
-    return VG_PROMPT_FORMATS[prompt_format]
-
-
 def get_vg_object_names(data_root):
     """Load the canonical 150 VG object names in zero-based label order."""
     dictionary_path = (

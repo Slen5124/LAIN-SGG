@@ -70,6 +70,8 @@ class LAIN(nn.Module):
         min_instances: int = 3, max_instances: int = 15,
         object_class_to_target_class: List[list] = None,
         object_n_verb_to_interaction: List[list] = None,
+        object_class_names: Optional[List[str]] = None,
+        predicate_class_names: Optional[List[str]] = None,
 
     ) -> None:
         super().__init__()
@@ -98,6 +100,12 @@ class LAIN(nn.Module):
         self.min_instances = min_instances
         self.max_instances = max_instances
         self.object_class_to_target_class = object_class_to_target_class
+
+        # [SGG dynamic prompt]
+        # Raw VG names are kept outside the state dict and used only to
+        # construct literal pair-conditioned S-P-O text at runtime.
+        self.object_class_names = object_class_names
+        self.predicate_class_names = predicate_class_names
 
         self.num_classes = num_classes
 
@@ -157,9 +165,12 @@ class LAIN(nn.Module):
         # pairwise_tokens_collated = []
         all_logits = []
 
-        # get text embeds
+        # Get the original fixed text embeddings for HOI datasets.
+        # [SGG dynamic prompt]
+        # VG text depends on each S-O pair and is therefore built inside
+        # the image loop after pair indices are known.
         text_features = None
-        if self.args.use_prompt:
+        if self.args.use_prompt and self.dataset != "vg":
             if not self.training:
                 if self.tp is None: # when evaluation, compute text embeds once.
                     prompts = self.clip_head.prompt_learner()
@@ -207,6 +218,33 @@ class LAIN(nn.Module):
                 prior_collated.append(torch.zeros(2, 0, self.num_classes, device=device))
                 continue
 
+            if self.dataset == "vg":
+                # [SGG dynamic prompt]
+                # Expand each directed S-O pair over the active predicate
+                # vocabulary and encode literal S-P-O text in chunks.
+                triplet_prompts, predicate_indices = (
+                    self.build_vg_triplet_prompts(
+                        labels[x_keep],
+                        labels[y_keep],
+                    )
+                )
+
+                text_features = self.clip_head.encode_dynamic_text(
+                    classnames=triplet_prompts,
+                    class_indices=predicate_indices,
+                    chunk_size=self.args.text_prompt_batch_size,
+                    use_checkpoint=self.training,
+                )
+                text_features = text_features / text_features.norm(
+                    dim=-1,
+                    keepdim=True,
+                )
+                text_features = text_features.view(
+                    len(x_keep),
+                    len(self.predicate_class_names),
+                    -1,
+                )
+
             if self.args.use_hotoken:
                 # mask for each HO tokens + CLS
                 num_tokens = len(x_keep) + 1
@@ -230,7 +268,17 @@ class LAIN(nn.Module):
             global_feat = global_feat[:, :-1]
 
 
-            logits_text = global_feat @ text_features.T
+            if self.dataset == "vg":
+                # [SGG dynamic prompt]
+                # Every visual pair is compared only with its own 50
+                # literal S-P-O text features.
+                logits_text = torch.einsum(
+                    "bpd,pcd->bpc",
+                    global_feat,
+                    text_features,
+                )
+            else:
+                logits_text = global_feat @ text_features.T
             logits = logits_text.squeeze(0) * self.logit_scale_text.exp()
 
             boxes_h_collated.append(x_keep)
@@ -267,6 +315,80 @@ class LAIN(nn.Module):
             )
 
         return torch.nonzero(valid, as_tuple=True)
+
+    def build_vg_triplet_prompts(
+        self,
+        subject_labels: Tensor,
+        object_labels: Tensor,
+    ):
+        """Build pair-major literal VG S-P-O prompt strings."""
+        # [SGG dynamic prompt]
+        # Prompt order is pair-major so flattened text features can be
+        # reshaped back to [num_pairs, num_predicates, text_dim].
+        if self.object_class_names is None:
+            raise RuntimeError(
+                "VG object class names are not initialized"
+            )
+        if self.predicate_class_names is None:
+            raise RuntimeError(
+                "VG predicate class names are not initialized"
+            )
+        if len(subject_labels) != len(object_labels):
+            raise ValueError(
+                "VG subject/object pair counts do not match"
+            )
+
+        num_objects = len(self.object_class_names)
+        num_predicates = len(self.predicate_class_names)
+
+        if num_predicates != self.num_classes:
+            raise ValueError(
+                "VG predicate vocabulary mismatch: "
+                f"names={num_predicates}, "
+                f"num_classes={self.num_classes}"
+            )
+
+        subject_ids = subject_labels.detach().cpu().tolist()
+        object_ids = object_labels.detach().cpu().tolist()
+
+        triplet_prompts = []
+        predicate_indices = []
+
+        for subject_id, object_id in zip(
+            subject_ids,
+            object_ids,
+        ):
+            if not (
+                0 <= subject_id < num_objects
+                and 0 <= object_id < num_objects
+            ):
+                raise ValueError(
+                    "VG pair label is outside the object vocabulary: "
+                    f"subject={subject_id}, object={object_id}, "
+                    f"num_objects={num_objects}"
+                )
+
+            subject_name = self.object_class_names[subject_id]
+            object_name = self.object_class_names[object_id]
+
+            for predicate_index, predicate_name in enumerate(
+                self.predicate_class_names
+            ):
+                triplet_prompts.append(
+                    "a photo of "
+                    f"{subject_name} "
+                    f"{predicate_name} "
+                    f"{object_name}"
+                )
+                predicate_indices.append(predicate_index)
+
+        predicate_indices = torch.tensor(
+            predicate_indices,
+            dtype=torch.long,
+            device=subject_labels.device,
+        )
+
+        return triplet_prompts, predicate_indices
 
     def recover_boxes(self, boxes, size):
         boxes = box_ops.box_cxcywh_to_xyxy(boxes)
@@ -709,6 +831,16 @@ def build_detector(
             raise ValueError(
                 "--egtr-detector-dir is required for VG"
             )
+        # [SGG dynamic prompt]
+        # Literal S-P-O classification requires the prompt learner path.
+        if not args.use_prompt:
+            raise ValueError(
+                "--use_prompt is required for VG dynamic S-P-O text"
+            )
+        if args.text_prompt_batch_size <= 0:
+            raise ValueError(
+                "--text-prompt-batch-size must be positive"
+            )
 
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(
@@ -779,13 +911,14 @@ def build_detector(
 
     elif args.dataset == 'vg' and args.num_classes == 50:
         from utils.vg_list import (
+            VG150_PREDICATES,
             get_vg_object_names,
-            get_vg_predicates,
         )
 
-        classnames = get_vg_predicates(
-            args.vg_prompt_format
-        )
+        # [SGG dynamic prompt]
+        # Learn one context per bare predicate. Subject/object names are
+        # inserted later for every directed proposal pair.
+        classnames = list(VG150_PREDICATES)
 
     else:
         raise NotImplementedError(
@@ -843,6 +976,16 @@ def build_detector(
         max_instances=args.max_instances,
         object_class_to_target_class=class_corr,
         object_n_verb_to_interaction=object_n_verb_to_interaction,
+        object_class_names=(
+            vg_object_names
+            if args.dataset == "vg"
+            else None
+        ),
+        predicate_class_names=(
+            classnames
+            if args.dataset == "vg"
+            else None
+        ),
     )
 
     return detector

@@ -18,17 +18,6 @@ def get_args():
         type=str,
         choices=('sine', 'learned'),
     )
-    parser.add_argument(
-        '--vg-prompt-format',
-        default='person',
-        choices=['person', 'something', 'bare'],
-        help=(
-            'Prompt template for VG predicates. '
-            'person preserves the original HOI assumption; '
-            'something and bare are ablations.'
-        ),
-    )
-
     parser.add_argument('--repr-dim', default=512, type=int)
     parser.add_argument('--hidden-dim', default=256, type=int)
     parser.add_argument('--enc-layers', default=6, type=int)
@@ -240,6 +229,13 @@ def get_args():
     parser.add_argument('--CSC', action='store_true')
     parser.add_argument('--CTX_INIT', type=str, default='')
     parser.add_argument('--CLASS_TOKEN_POSITION', type=str, default='end')
+    # [SGG dynamic prompt]
+    # Operational chunk size for literal pair-conditioned S-P-O text.
+    parser.add_argument(
+        '--text-prompt-batch-size',
+        default=256,
+        type=int,
+    )
 
     # Miscellaneous
     parser.add_argument('--job_id', default=1985, type=int)
