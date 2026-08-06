@@ -649,7 +649,10 @@ def build_detector(
         )
 
     elif args.dataset == 'vg' and args.num_classes == 50:
-        from utils.vg_list import get_vg_predicates
+        from utils.vg_list import (
+            get_vg_object_names,
+            get_vg_predicates,
+        )
 
         classnames = get_vg_predicates(
             args.vg_prompt_format
@@ -671,10 +674,30 @@ def build_detector(
 
     model = CustomCLIP(args, classnames=classnames, clip_model=clip_model)
 
-    obj_class_names = [obj[1] for obj in hico_text_label.hico_obj_text_label]
+    if args.dataset == "vg":
+        vg_object_names = get_vg_object_names(
+            args.data_root
+        )
+        obj_class_names = [
+            f"a photo of a {name}"
+            for name in vg_object_names
+        ]
+    else:
+        obj_class_names = [
+            obj[1]
+            for obj in hico_text_label.hico_obj_text_label
+        ]
 
     object_embedding = get_obj_text_emb(args, clip_model=clip_model, obj_class_names=obj_class_names)
     object_embedding = object_embedding.clone().detach()
+
+    expected_object_classes = 150 if args.dataset == "vg" else len(obj_class_names)
+    if object_embedding.shape[0] != expected_object_classes:
+        raise ValueError(
+            "Object embedding count mismatch: "
+            f"expected={expected_object_classes}, "
+            f"actual={object_embedding.shape[0]}"
+        )
 
     detector = LAIN(
         args,
