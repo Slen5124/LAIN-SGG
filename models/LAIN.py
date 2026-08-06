@@ -37,6 +37,10 @@ from detr.models.detr import DETR
 from detr.util import box_ops
 from detr.util.misc import nested_tensor_from_tensor_list
 sys.path.pop(0)
+from models.egtr_detector import (
+    EgtrPostProcess,
+    load_egtr_vg_detector,
+)
 
 class MLP(nn.Module):
     """ Very simple multi-layer perceptron (also called FFN)"""
@@ -51,6 +55,7 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
+
 
 class LAIN(nn.Module):
     def __init__(self,
@@ -121,7 +126,7 @@ class LAIN(nn.Module):
 
     def compute_prior_scores(self,
         x: Tensor, y: Tensor, scores: Tensor, object_class: Tensor
-    ) -> Tensor:  ### √
+    ) -> Tensor:
 
         prior_h = torch.zeros(len(x), self.num_classes, device=scores.device)
         prior_o = torch.zeros_like(prior_h)
@@ -187,7 +192,7 @@ class LAIN(nn.Module):
                 perm = torch.cat([h_idx, o_idx])
                 boxes = boxes[perm]; scores = scores[perm]
                 labels = labels[perm]
-                feats = feats[perm] # 추가된 코드
+                feats = feats[perm]
             # Skip image when there are no valid human-object pairs
             if n_h == 0 or n <= 1:
                 boxes_h_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
@@ -302,10 +307,15 @@ class LAIN(nn.Module):
 
         return loss / max(n_p, 1)
 
-    def prepare_region_proposals(self, results): ## √ detr extracts the human-object pairs
+    def prepare_region_proposals(self, results):
         region_props = []
         for res in results:
-            sc, lb, bx, feat = res.values()
+            # Explicit keys keep detector adapters independent of
+            # dictionary insertion order.
+            sc = res["scores"]
+            lb = res["labels"]
+            bx = res["boxes"]
+            feat = res["feats"]
 
             keep = batched_nms(bx, sc, lb, 0.5)
             sc = sc[keep].view(-1)
@@ -420,22 +430,54 @@ class LAIN(nn.Module):
             im.size()[-2:] for im in images_orig
             ], device=device)
 
-
         if isinstance(images_orig, (list, torch.Tensor)):
             images_orig = nested_tensor_from_tensor_list(images_orig)
-        features, pos = self.detector.backbone(images_orig)
-        src, mask = features[-1].decompose()
-        # assert mask is not None2
-        hs, detr_memory = self.detector.transformer(self.detector.input_proj(src), mask, self.detector.query_embed.weight, pos[-1])
-        outputs_class = self.detector.class_embed(hs) # 6x8x100x81 or 6x8x100x92
-        outputs_coord = self.detector.bbox_embed(hs).sigmoid() # 6x8x100x4
-        if self.dataset == 'vcoco' and outputs_class.shape[-1] == 92:
-            outputs_class = outputs_class[:, :, :, self.reserve_indices]
-            assert outputs_class.shape[-1] == 81, 'reserved shape NOT match 81'
 
-        results = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'feats': hs[-1]}
+        if self.dataset == "vg":
+            if images_orig.mask is None:
+                raise RuntimeError(
+                    "EGTR detector requires a valid image padding mask"
+                )
+
+            detector_outputs = self.detector(
+                pixel_values=images_orig.tensors,
+                pixel_mask=(~images_orig.mask).long(),
+            )
+
+            results = {
+                "pred_logits": detector_outputs.logits,
+                "pred_boxes": detector_outputs.pred_boxes,
+                "feats": detector_outputs.last_hidden_state,
+            }
+        else:
+            # Original LAIN DETR path for HICO-DET and V-COCO.
+            features, pos = self.detector.backbone(images_orig)
+            src, mask = features[-1].decompose()
+
+            hs, _ = self.detector.transformer(
+                self.detector.input_proj(src),
+                mask,
+                self.detector.query_embed.weight,
+                pos[-1],
+            )
+
+            outputs_class = self.detector.class_embed(hs)
+            outputs_coord = self.detector.bbox_embed(hs).sigmoid()
+
+            if self.dataset == "vcoco" and outputs_class.shape[-1] == 92:
+                outputs_class = outputs_class[:, :, :, self.reserve_indices]
+                assert outputs_class.shape[-1] == 81
+
+            results = {
+                "pred_logits": outputs_class[-1],
+                "pred_boxes": outputs_coord[-1],
+                "feats": hs[-1],
+            }
+
+        # LAIN consumes boxes in the 224x224 CLIP-image coordinate space.
         results = self.postprocessor(results, image_sizes)
         region_props = self.prepare_region_proposals(results)
+
 
         priors = self.get_prior(region_props,image_sizes)
 
@@ -464,7 +506,7 @@ class LAIN(nn.Module):
         detections = self.postprocessing(boxes, bh, bo, logits, prior, objects, image_sizes)
         return detections
 
-    def postprocessing(self, boxes, bh, bo, logits, prior, objects, image_sizes): ### √
+    def postprocessing(self, boxes, bh, bo, logits, prior, objects, image_sizes):
         n = [len(b) for b in bh]
         logits = torch.cat(logits)
         logits = logits.split(n)
@@ -495,34 +537,71 @@ def get_obj_text_emb(args, clip_model, obj_class_names):
     return object_embedding
 
 
-def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_path):
-    # build DETR
-    num_classes = 80
-    if args.dataset == 'vcoco' and 'e632da11' in args.pretrained:
-        num_classes = 91
+def build_detector(
+    args,
+    class_corr,
+    object_n_verb_to_interaction,
+    clip_model_path,
+):
+    if args.dataset == "vg":
+        if not args.egtr_detector_dir:
+            raise ValueError(
+                "--egtr-detector-dir is required for VG"
+            )
 
-    backbone = build_backbone(args)
-    transformer = build_transformer(args)
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(
+                "Load the EGTR VG detector from "
+                f"{args.egtr_detector_dir}"
+            )
 
-    detr = DETR(
-        backbone,
-        transformer,
-        num_classes=num_classes,
-        num_queries=args.num_queries,
-        aux_loss=args.aux_loss,
-    )
+        detr = load_egtr_vg_detector(
+            args.egtr_detector_dir
+        )
+        postprocessor = EgtrPostProcess()
 
-    postprocessors = {'bbox': PostProcess()}
+    else:
+        # Original LAIN detector construction for HOI datasets.
+        num_classes = 80
 
-    # detr, _, postprocessors = build_model(args)
-    if os.path.exists(args.pretrained):
-        if dist.get_rank() == 0:
-            print(f"Load weights for the object detector from {args.pretrained}")
-        if 'e632da11' in args.pretrained:
-            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu', weights_only=False)['model']) 
-        else:
-            detr.load_state_dict(torch.load(args.pretrained, map_location='cpu', weights_only=False)['model_state_dict'])
-    
+        if (
+            args.dataset == "vcoco"
+            and "e632da11" in args.pretrained
+        ):
+            num_classes = 91
+
+        backbone = build_backbone(args)
+        transformer = build_transformer(args)
+
+        detr = DETR(
+            backbone,
+            transformer,
+            num_classes=num_classes,
+            num_queries=args.num_queries,
+            aux_loss=args.aux_loss,
+        )
+
+        postprocessor = PostProcess()
+
+        if os.path.exists(args.pretrained):
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(
+                    "Load weights for the object detector from "
+                    f"{args.pretrained}"
+                )
+
+            checkpoint = torch.load(
+                args.pretrained,
+                map_location="cpu",
+                weights_only=False,
+            )
+
+            if "e632da11" in args.pretrained:
+                detr.load_state_dict(checkpoint["model"])
+            else:
+                detr.load_state_dict(
+                    checkpoint["model_state_dict"]
+                )
     clip_state_dict = torch.load(clip_model_path, map_location="cpu", weights_only=False).state_dict()
     clip_model = build_model(state_dict=clip_state_dict, use_adapter=args.use_insadapter, adapter_pos=args.adapter_pos, args=args)
 
@@ -565,9 +644,14 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
     object_embedding = get_obj_text_emb(args, clip_model=clip_model, obj_class_names=obj_class_names)
     object_embedding = object_embedding.clone().detach()
 
-    detector = LAIN(args,
-        detr, postprocessors['bbox'], model, object_embedding,
-        human_idx=args.human_idx, num_classes=args.num_classes,
+    detector = LAIN(
+        args,
+        detr,
+        postprocessor,
+        model,
+        object_embedding,
+        human_idx=args.human_idx,
+        num_classes=args.num_classes,
         alpha=args.alpha, gamma=args.gamma,
         box_score_thresh=args.box_score_thresh,
         fg_iou_thresh=args.fg_iou_thresh,
@@ -578,4 +662,3 @@ def build_detector(args, class_corr, object_n_verb_to_interaction, clip_model_pa
     )
 
     return detector
-

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Union
 
 import torch
-from torch import Tensor
+from torch import Tensor, nn
 from transformers import (
     DeformableDetrConfig,
     DeformableDetrForObjectDetection,
@@ -203,3 +203,87 @@ def load_egtr_vg_detector(
         )
 
     return model
+
+
+class EgtrPostProcess(nn.Module):
+    """Convert raw EGTR detector outputs to LAIN proposal format."""
+
+    @torch.no_grad()
+    def forward(
+        self,
+        outputs: Dict[str, Tensor],
+        target_sizes: Tensor,
+    ):
+        logits = outputs["pred_logits"]
+        pred_boxes = outputs["pred_boxes"]
+        features = outputs["feats"]
+
+        if logits.ndim != 3:
+            raise ValueError(
+                f"Expected logits [B, Q, C], got {tuple(logits.shape)}"
+            )
+
+        if pred_boxes.shape[:2] != logits.shape[:2]:
+            raise ValueError(
+                "Box/query dimensions do not match logits: "
+                f"logits={tuple(logits.shape)}, "
+                f"boxes={tuple(pred_boxes.shape)}"
+            )
+
+        if features.shape[:2] != logits.shape[:2]:
+            raise ValueError(
+                "Feature/query dimensions do not match logits: "
+                f"logits={tuple(logits.shape)}, "
+                f"features={tuple(features.shape)}"
+            )
+
+        if target_sizes.ndim != 2 or target_sizes.shape[1] != 2:
+            raise ValueError(
+                "target_sizes must have shape [B, 2], "
+                f"got {tuple(target_sizes.shape)}"
+            )
+
+        # EGTR uses 150 sigmoid object logits without a separate
+        # softmax background column.
+        probabilities = logits.sigmoid()
+        scores, labels = probabilities.max(dim=-1)
+
+        center_x, center_y, width, height = pred_boxes.unbind(-1)
+
+        boxes = torch.stack(
+            [
+                center_x - 0.5 * width,
+                center_y - 0.5 * height,
+                center_x + 0.5 * width,
+                center_y + 0.5 * height,
+            ],
+            dim=-1,
+        )
+
+        image_height, image_width = target_sizes.unbind(1)
+        scale = torch.stack(
+            [
+                image_width,
+                image_height,
+                image_width,
+                image_height,
+            ],
+            dim=1,
+        )
+
+        boxes = boxes * scale[:, None, :]
+
+        return [
+            {
+                "scores": image_scores,
+                "labels": image_labels,
+                "boxes": image_boxes,
+                "feats": image_features,
+            }
+            for (
+                image_scores,
+                image_labels,
+                image_boxes,
+                image_features,
+            ) in zip(scores, labels, boxes, features)
+        ]
