@@ -183,34 +183,29 @@ class LAIN(nn.Module):
             labels = props['labels']
             feats = props['feat']
 
-            is_human = labels == self.human_idx
-            n_h = torch.sum(is_human); n = len(boxes)
-            # Permute human instances to the top
-            if not torch.all(labels[:n_h]==self.human_idx):
-                h_idx = torch.nonzero(is_human).squeeze(1)
-                o_idx = torch.nonzero(is_human == 0).squeeze(1)
-                perm = torch.cat([h_idx, o_idx])
-                boxes = boxes[perm]; scores = scores[perm]
-                labels = labels[perm]
-                feats = feats[perm]
-            # Skip image when there are no valid human-object pairs
-            if n_h == 0 or n <= 1:
+            if self.dataset != "vg":
+                is_human = labels == self.human_idx
+                n_h = torch.sum(is_human)
+
+                # Preserve the original LAIN ordering for HOI datasets.
+                if not torch.all(labels[:n_h] == self.human_idx):
+                    h_idx = torch.nonzero(is_human).squeeze(1)
+                    o_idx = torch.nonzero(is_human == 0).squeeze(1)
+                    perm = torch.cat([h_idx, o_idx])
+                    boxes = boxes[perm]
+                    scores = scores[perm]
+                    labels = labels[perm]
+                    feats = feats[perm]
+
+            x_keep, y_keep = self.generate_pair_indices(labels)
+
+            # Skip images that do not contain a valid relation pair.
+            if len(x_keep) == 0:
                 boxes_h_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
                 boxes_o_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
                 object_class_collated.append(torch.zeros(0, device=device, dtype=torch.int64))
                 prior_collated.append(torch.zeros(2, 0, self.num_classes, device=device))
                 continue
-
-            # Get the pairwise indices
-            x, y = torch.meshgrid(
-                torch.arange(n, device=device),
-                torch.arange(n, device=device)
-            )
-            # Valid human-object pairs
-            x_keep, y_keep = torch.nonzero(torch.logical_and(x != y, x < n_h)).unbind(1)
-            if len(x_keep) == 0:
-                # Should never happen, just to be safe
-                raise ValueError("There are no valid human-object pairs")
 
             if self.args.use_hotoken:
                 # mask for each HO tokens + CLS
@@ -247,6 +242,31 @@ class LAIN(nn.Module):
             all_logits.append(logits)
 
         return all_logits, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated
+
+    def generate_pair_indices(self, labels: Tensor):
+        """Generate directed relation pairs for the active dataset."""
+        n = len(labels)
+        device = labels.device
+
+        if n <= 1:
+            empty = torch.zeros(0, dtype=torch.long, device=device)
+            return empty, empty
+
+        x, y = torch.meshgrid(
+            torch.arange(n, device=device),
+            torch.arange(n, device=device),
+            indexing="ij",
+        )
+
+        if self.dataset == "vg":
+            valid = x != y
+        else:
+            valid = torch.logical_and(
+                x != y,
+                labels[x] == self.human_idx,
+            )
+
+        return torch.nonzero(valid, as_tuple=True)
 
     def recover_boxes(self, boxes, size):
         boxes = box_ops.box_cxcywh_to_xyxy(boxes)
