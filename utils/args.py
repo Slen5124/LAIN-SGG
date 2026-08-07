@@ -229,14 +229,6 @@ def get_args():
     parser.add_argument('--CSC', action='store_true')
     parser.add_argument('--CTX_INIT', type=str, default='')
     parser.add_argument('--CLASS_TOKEN_POSITION', type=str, default='end')
-    # [SGG dynamic prompt]
-    # Operational chunk size for literal pair-conditioned S-P-O text.
-    parser.add_argument(
-        '--text-prompt-batch-size',
-        default=256,
-        type=int,
-    )
-
     # Miscellaneous
     parser.add_argument('--job_id', default=1985, type=int)
     parser.add_argument('--vis', action='store_true')

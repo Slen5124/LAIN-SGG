@@ -70,8 +70,6 @@ class LAIN(nn.Module):
         min_instances: int = 3, max_instances: int = 15,
         object_class_to_target_class: List[list] = None,
         object_n_verb_to_interaction: List[list] = None,
-        object_class_names: Optional[List[str]] = None,
-        predicate_class_names: Optional[List[str]] = None,
 
     ) -> None:
         super().__init__()
@@ -100,12 +98,6 @@ class LAIN(nn.Module):
         self.min_instances = min_instances
         self.max_instances = max_instances
         self.object_class_to_target_class = object_class_to_target_class
-
-        # [SGG dynamic prompt]
-        # Raw VG names are kept outside the state dict and used only to
-        # construct literal pair-conditioned S-P-O text at runtime.
-        self.object_class_names = object_class_names
-        self.predicate_class_names = predicate_class_names
 
         self.num_classes = num_classes
 
@@ -409,80 +401,6 @@ class LAIN(nn.Module):
             )
 
         return torch.nonzero(valid, as_tuple=True)
-
-    def build_vg_triplet_prompts(
-        self,
-        subject_labels: Tensor,
-        object_labels: Tensor,
-    ):
-        """Build pair-major literal VG S-P-O prompt strings."""
-        # [SGG dynamic prompt]
-        # Prompt order is pair-major so flattened text features can be
-        # reshaped back to [num_pairs, num_predicates, text_dim].
-        if self.object_class_names is None:
-            raise RuntimeError(
-                "VG object class names are not initialized"
-            )
-        if self.predicate_class_names is None:
-            raise RuntimeError(
-                "VG predicate class names are not initialized"
-            )
-        if len(subject_labels) != len(object_labels):
-            raise ValueError(
-                "VG subject/object pair counts do not match"
-            )
-
-        num_objects = len(self.object_class_names)
-        num_predicates = len(self.predicate_class_names)
-
-        if num_predicates != self.num_classes:
-            raise ValueError(
-                "VG predicate vocabulary mismatch: "
-                f"names={num_predicates}, "
-                f"num_classes={self.num_classes}"
-            )
-
-        subject_ids = subject_labels.detach().cpu().tolist()
-        object_ids = object_labels.detach().cpu().tolist()
-
-        triplet_prompts = []
-        predicate_indices = []
-
-        for subject_id, object_id in zip(
-            subject_ids,
-            object_ids,
-        ):
-            if not (
-                0 <= subject_id < num_objects
-                and 0 <= object_id < num_objects
-            ):
-                raise ValueError(
-                    "VG pair label is outside the object vocabulary: "
-                    f"subject={subject_id}, object={object_id}, "
-                    f"num_objects={num_objects}"
-                )
-
-            subject_name = self.object_class_names[subject_id]
-            object_name = self.object_class_names[object_id]
-
-            for predicate_index, predicate_name in enumerate(
-                self.predicate_class_names
-            ):
-                triplet_prompts.append(
-                    "a photo of "
-                    f"{subject_name} "
-                    f"{predicate_name} "
-                    f"{object_name}"
-                )
-                predicate_indices.append(predicate_index)
-
-        predicate_indices = torch.tensor(
-            predicate_indices,
-            dtype=torch.long,
-            device=subject_labels.device,
-        )
-
-        return triplet_prompts, predicate_indices
 
     def recover_boxes(self, boxes, size):
         boxes = box_ops.box_cxcywh_to_xyxy(boxes)
@@ -1124,15 +1042,11 @@ def build_detector(
             raise ValueError(
                 "--egtr-detector-dir is required for VG"
             )
-        # [SGG dynamic prompt]
-        # Literal S-P-O classification requires the prompt learner path.
+        # [SGG compositional text]
+        # Learned predicate contexts remain part of VG composition.
         if not args.use_prompt:
             raise ValueError(
-                "--use_prompt is required for VG dynamic S-P-O text"
-            )
-        if args.text_prompt_batch_size <= 0:
-            raise ValueError(
-                "--text-prompt-batch-size must be positive"
+                "--use_prompt is required for VG compositional text"
             )
 
         if not dist.is_initialized() or dist.get_rank() == 0:
@@ -1208,9 +1122,9 @@ def build_detector(
             get_vg_object_names,
         )
 
-        # [SGG dynamic prompt]
-        # Learn one context per bare predicate. Subject/object names are
-        # inserted later for every directed proposal pair.
+        # [SGG compositional text]
+        # Learn one context per bare predicate. Ordered subject/object
+        # information is injected later by the lightweight pair composer.
         classnames = list(VG150_PREDICATES)
 
     else:
@@ -1269,16 +1183,6 @@ def build_detector(
         max_instances=args.max_instances,
         object_class_to_target_class=class_corr,
         object_n_verb_to_interaction=object_n_verb_to_interaction,
-        object_class_names=(
-            vg_object_names
-            if args.dataset == "vg"
-            else None
-        ),
-        predicate_class_names=(
-            classnames
-            if args.dataset == "vg"
-            else None
-        ),
     )
 
     return detector
