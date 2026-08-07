@@ -397,54 +397,237 @@ class LAIN(nn.Module):
         boxes = boxes * scale_fct
         return boxes
 
-    def associate_with_ground_truth(self, boxes_h, boxes_o, targets): ## for training
+    def associate_with_ground_truth(
+        self,
+        boxes_h,
+        boxes_o,
+        subject_labels,
+        object_labels,
+        targets,
+    ):
+        """Associate predicted relation pairs with ground-truth triplets."""
         n = boxes_h.shape[0]
-        labels = torch.zeros(n, self.num_classes, device=boxes_h.device)
+        labels = torch.zeros(
+            n,
+            self.num_classes,
+            device=boxes_h.device,
+        )
 
-        gt_bx_h = self.recover_boxes(targets['boxes_h'], targets['size'])
-        gt_bx_o = self.recover_boxes(targets['boxes_o'], targets['size'])
+        if not (
+            len(boxes_h)
+            == len(boxes_o)
+            == len(subject_labels)
+            == len(object_labels)
+        ):
+            raise ValueError(
+                "Predicted relation-pair fields must have equal lengths"
+            )
 
-        x, y = torch.nonzero(torch.min(
-            box_iou(boxes_h, gt_bx_h),
-            box_iou(boxes_o, gt_bx_o)
-        ) >= self.fg_iou_thresh).unbind(1)
-        # print("pair gt,",len(x),len(y))
-        # IndexError: tensors used as indices must be long, byte or bool tensors
+        gt_bx_h = self.recover_boxes(
+            targets["boxes_h"],
+            targets["size"],
+        )
+        gt_bx_o = self.recover_boxes(
+            targets["boxes_o"],
+            targets["size"],
+        )
 
-        if self.num_classes in [24, 50, 117, 407]:
-            labels[x, targets['labels'][y]] = 1
+        if len(gt_bx_h) != len(gt_bx_o):
+            raise ValueError(
+                "Ground-truth subject/object box counts do not match"
+            )
+
+        # Both sides of a relation pair must overlap the corresponding
+        # ground-truth subject and object boxes.
+        subject_iou = box_iou(boxes_h, gt_bx_h)
+        object_iou = box_iou(boxes_o, gt_bx_o)
+        pair_matches = torch.min(
+            subject_iou,
+            object_iou,
+        ) >= self.fg_iou_thresh
+
+        if self.dataset == "vg":
+            # [SGG class-aware matching]
+            # VG permits every object class to be either the subject or
+            # object, so box overlap alone is not a valid triplet match.
+            required_fields = {
+                "subject",
+                "object",
+                "verb",
+            }
+            missing_fields = required_fields.difference(targets)
+
+            if missing_fields:
+                raise KeyError(
+                    "VG target is missing fields required for "
+                    f"class-aware matching: {sorted(missing_fields)}"
+                )
+
+            gt_subject_labels = targets["subject"].long()
+            gt_object_labels = targets["object"].long()
+            gt_predicates = targets["verb"].long()
+            num_gt_relations = len(gt_bx_h)
+
+            if not (
+                len(gt_subject_labels)
+                == len(gt_object_labels)
+                == len(gt_predicates)
+                == num_gt_relations
+            ):
+                raise ValueError(
+                    "VG GT triplet fields must have equal lengths: "
+                    f"boxes={num_gt_relations}, "
+                    f"subject={len(gt_subject_labels)}, "
+                    f"object={len(gt_object_labels)}, "
+                    f"verb={len(gt_predicates)}"
+                )
+
+            subject_class_matches = (
+                subject_labels.long()[:, None]
+                == gt_subject_labels[None, :]
+            )
+            object_class_matches = (
+                object_labels.long()[:, None]
+                == gt_object_labels[None, :]
+            )
+            pair_matches = (
+                pair_matches
+                & subject_class_matches
+                & object_class_matches
+            )
+            target_predicates = gt_predicates
+
         else:
-            labels[x, targets['hoi'][y]] = 1
+            # [Compatibility]
+            # Preserve the original HICO-DET/V-COCO matching semantics.
+            if self.num_classes in [24, 117, 407]:
+                target_predicates = targets["labels"].long()
+            else:
+                target_predicates = targets["hoi"].long()
+
+        predicted_pair_indices, gt_relation_indices = torch.nonzero(
+            pair_matches,
+            as_tuple=True,
+        )
+
+        if len(gt_relation_indices) > 0:
+            selected_predicates = target_predicates[
+                gt_relation_indices
+            ]
+
+            if (
+                selected_predicates.min().item() < 0
+                or selected_predicates.max().item() >= self.num_classes
+            ):
+                raise ValueError(
+                    "Predicate label is outside the active vocabulary: "
+                    f"min={selected_predicates.min().item()}, "
+                    f"max={selected_predicates.max().item()}, "
+                    f"num_classes={self.num_classes}"
+                )
+
+            # Repeated assignments preserve multiple predicates attached
+            # to the same directed subject-object pair.
+            labels[
+                predicted_pair_indices,
+                selected_predicates,
+            ] = 1
+
         return labels
 
-    def compute_interaction_loss(self, boxes, bh, bo, logits, prior, targets): ### loss
-        ## bx, bo: indices of boxes
+    def compute_interaction_loss(
+        self,
+        boxes,
+        bh,
+        bo,
+        logits,
+        prior,
+        proposal_labels,
+        targets,
+    ):
+        """Compute the LAIN relation classification loss."""
+        batch_field_lengths = {
+            len(boxes),
+            len(bh),
+            len(bo),
+            len(logits),
+            len(prior),
+            len(proposal_labels),
+            len(targets),
+        }
+
+        if len(batch_field_lengths) != 1:
+            raise ValueError(
+                "Interaction-loss batch fields have different lengths: "
+                f"boxes={len(boxes)}, "
+                f"bh={len(bh)}, "
+                f"bo={len(bo)}, "
+                f"logits={len(logits)}, "
+                f"prior={len(prior)}, "
+                f"proposal_labels={len(proposal_labels)}, "
+                f"targets={len(targets)}"
+            )
+
         labels = torch.cat([
-            self.associate_with_ground_truth(bx[h], bx[o], target)
-            for bx, h, o, target in zip(boxes, bh, bo, targets)
+            self.associate_with_ground_truth(
+                bx[h],
+                bx[o],
+                proposal_label[h],
+                proposal_label[o],
+                target,
+            )
+            for (
+                bx,
+                h,
+                o,
+                proposal_label,
+                target,
+            ) in zip(
+                boxes,
+                bh,
+                bo,
+                proposal_labels,
+                targets,
+            )
         ])
 
-
+        # The original LAIN prior remains downstream weighting/filtering;
+        # it is not used as the VG ground-truth matching criterion.
         prior = torch.cat(prior, dim=1).prod(0)
-        x, y = torch.nonzero(prior).unbind(1)
+        x, y = torch.nonzero(
+            prior,
+            as_tuple=True,
+        )
         logits = torch.cat(logits)
-        logits = logits[x, y]; prior = prior[x, y]; labels = labels[x, y]
+        logits = logits[x, y]
+        prior = prior[x, y]
+        labels = labels[x, y]
 
-
-        n_p = len(torch.nonzero(labels))
+        n_p = torch.count_nonzero(labels)
         if dist.is_initialized():
             world_size = dist.get_world_size()
-            n_p = torch.as_tensor([n_p], device='cuda')
+            n_p = torch.as_tensor(
+                [n_p],
+                device=logits.device,
+            )
             dist.barrier()
             dist.all_reduce(n_p)
             n_p = (n_p / world_size).item()
 
-
         loss = binary_focal_loss_with_logits(
-        torch.log(
-            prior / (1 + torch.exp(-logits) - prior) + 1e-8
-        ), labels, reduction='sum',
-        alpha=self.alpha, gamma=self.gamma
+            torch.log(
+                prior
+                / (
+                    1
+                    + torch.exp(-logits)
+                    - prior
+                )
+                + 1e-8
+            ),
+            labels,
+            reduction="sum",
+            alpha=self.alpha,
+            gamma=self.gamma,
         )
 
         return loss / max(n_p, 1)
@@ -770,8 +953,24 @@ class LAIN(nn.Module):
         logits, prior, bh, bo, objects = self.compute_sim_scores(region_props,images_clip,priors)
         boxes = [r['boxes'] for r in region_props]
 
+        # [SGG class-aware matching]
+        # Passing code: carry detector class IDs to the training matcher;
+        # relation scoring itself is unchanged here.
+        proposal_labels = [
+            region_prop["labels"]
+            for region_prop in region_props
+        ]
+
         if self.training:
-            interaction_loss = self.compute_interaction_loss(boxes, bh, bo, logits, prior, targets)
+            interaction_loss = self.compute_interaction_loss(
+                boxes,
+                bh,
+                bo,
+                logits,
+                prior,
+                proposal_labels,
+                targets,
+            )
 
             loss_dict = dict(
                 interaction_loss=interaction_loss
