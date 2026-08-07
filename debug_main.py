@@ -26,7 +26,11 @@ from utils.hico_text_label import hico_unseen_index
 warnings.filterwarnings("ignore")
 
 def main(rank, args):
-    torch.autograd.set_detect_anomaly(True)
+    # [AMP debug compatibility]
+    # GradScaler must be allowed to skip an overflowing FP16 step and lower
+    # its scale. Autograd anomaly mode raises before that recovery can occur.
+    # Keep anomaly tracing for the original FP32 debug path.
+    torch.autograd.set_detect_anomaly(not args.amp)
     dist.init_process_group(
         backend="nccl",
         init_method="env://",

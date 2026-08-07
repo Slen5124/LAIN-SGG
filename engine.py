@@ -57,7 +57,19 @@ class CustomisedDLE(DistributedLearningEngine):
         self.best_seen = -1
         self.args = args
         if self.args.amp:
-            self.scaler = amp.GradScaler(enabled=True)
+            # [AMP initial scale]
+            # VG smoke tests showed repeated skipped updates while the default
+            # 65536 scale backed off to 256. Start at the observed stable scale;
+            # GradScaler can still grow or reduce it dynamically afterwards.
+            self.scaler = amp.GradScaler(
+                enabled=True,
+                init_scale=256.0,
+            )
+            # [AMP checkpoint state]
+            # Pocket saves the scaler stored in engine state. Register the
+            # exact scaler used for backward/step so fresh-run checkpoints do
+            # not serialize a separate default-scale object.
+            self.update_state_key(scaler=self.scaler)
 
     def _on_end_iteration(self):
         # Print stats in the master process
@@ -101,15 +113,37 @@ class CustomisedDLE(DistributedLearningEngine):
         with amp.autocast(enabled=self.args.amp):
             loss_dict = self._state.net(
                 *self._state.inputs, targets=self._state.targets)
-        if loss_dict['interaction_loss'].isnan():
-            raise ValueError(f"The HOI loss is NaN for rank {self._rank}")
+        # [Training safety]
+        # Stop on either NaN or infinity before a corrupt optimizer update.
+        if not torch.isfinite(loss_dict['interaction_loss']):
+            raise ValueError(
+                f"The interaction loss is non-finite for rank {self._rank}"
+            )
 
         if self.args.amp:
             self._state.loss = sum(loss for loss in loss_dict.values())
             self._state.optimizer.zero_grad(set_to_none=True)
+            scale_before = self.scaler.get_scale()
             self.scaler.scale(self._state.loss).backward()
+            # [AMP gradient clipping]
+            # Gradients must be unscaled before applying the same max-norm
+            # rule used by the FP32 path; otherwise AMP changes optimization.
+            if self.max_norm > 0:
+                self.scaler.unscale_(self._state.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self._state.net.parameters(),
+                    self.max_norm,
+                )
             self.scaler.step(self._state.optimizer)
             self.scaler.update()
+            scale_after = self.scaler.get_scale()
+            if self._rank == 0 and scale_after < scale_before:
+                # [AMP overflow visibility]
+                # GradScaler skipped this update and reduced its scale.
+                print(
+                    '[WARN] AMP gradient overflow: '
+                    f'scale {scale_before:g} -> {scale_after:g}'
+                )
         else:
             self._state.loss = sum(loss for loss in loss_dict.values())
             self._state.optimizer.zero_grad(set_to_none=True)

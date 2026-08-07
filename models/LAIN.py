@@ -191,14 +191,27 @@ class LAIN(nn.Module):
                 if self.tp is None: # when evaluation, compute text embeds once.
                     prompts = self.clip_head.prompt_learner()
                     text_features = self.clip_head.text_encoder(prompts, self.clip_head.tokenized_prompts)
-                    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                    # [AMP numerical stability]
+                    # Cosine normalization stays in FP32 because FP16 division
+                    # can produce finite outputs but non-finite gradients.
+                    text_features = F.normalize(
+                        text_features.float(),
+                        dim=-1,
+                        eps=1e-6,
+                    )
                     self.tp = text_features
                 else:
                     text_features = self.tp
             else:
                 prompts = self.clip_head.prompt_learner()
                 text_features = self.clip_head.text_encoder(prompts, self.clip_head.tokenized_prompts)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                # [AMP numerical stability]
+                # Keep the trainable text-normalization backward pass in FP32.
+                text_features = F.normalize(
+                    text_features.float(),
+                    dim=-1,
+                    eps=1e-6,
+                )
 
 
 
@@ -263,7 +276,14 @@ class LAIN(nn.Module):
                                                                        mask,la_masks)
 
 
-            global_feat = global_feat / global_feat.norm(dim=-1, keepdim=True)
+            # [AMP numerical stability]
+            # The visual backbone remains autocast; only cosine normalization
+            # is promoted to FP32 to avoid DivBackward0 overflow/underflow.
+            global_feat = F.normalize(
+                global_feat.float(),
+                dim=-1,
+                eps=1e-6,
+            )
             global_feat = global_feat[:, :-1]
 
 
@@ -338,44 +358,54 @@ class LAIN(nn.Module):
                     f"num_objects={num_object_classes}"
                 )
 
-        object_vocabulary_features = F.normalize(
-            self.object_embedding.to(predicate_features.dtype),
-            dim=-1,
-        )
-        subject_features = object_vocabulary_features[
-            subject_labels.long()
-        ]
-        object_features = object_vocabulary_features[
-            object_labels.long()
-        ]
+        # [AMP numerical stability]
+        # Pair composition is small relative to the visual/text backbones, so
+        # run its trainable normalizations and divisions in FP32.
+        with torch.autocast(
+            device_type=predicate_features.device.type,
+            enabled=False,
+        ):
+            predicate_features = predicate_features.float()
+            object_vocabulary_features = F.normalize(
+                self.object_embedding.float(),
+                dim=-1,
+                eps=1e-6,
+            )
+            subject_features = object_vocabulary_features[
+                subject_labels.long()
+            ]
+            object_features = object_vocabulary_features[
+                object_labels.long()
+            ]
 
-        ordered_pair_features = torch.cat(
-            [
-                subject_features,
-                object_features,
-                subject_features - object_features,
-                subject_features * object_features,
-            ],
-            dim=-1,
-        )
-        modulation = self.triplet_pair_composer(
-            ordered_pair_features
-        )
-        scale, shift = modulation.chunk(2, dim=-1)
+            ordered_pair_features = torch.cat(
+                [
+                    subject_features,
+                    object_features,
+                    subject_features - object_features,
+                    subject_features * object_features,
+                ],
+                dim=-1,
+            )
+            modulation = self.triplet_pair_composer(
+                ordered_pair_features
+            )
+            scale, shift = modulation.chunk(2, dim=-1)
 
-        # Bounded scaling prevents the newly initialized composer from
-        # overwhelming the pretrained CLIP predicate representation.
-        scale = torch.tanh(scale)
-        triplet_features = (
-            predicate_features.unsqueeze(0)
-            * (1.0 + scale.unsqueeze(1))
-            + shift.unsqueeze(1)
-        )
+            # Bounded scaling prevents the newly initialized composer from
+            # overwhelming the pretrained CLIP predicate representation.
+            scale = torch.tanh(scale)
+            triplet_features = (
+                predicate_features.unsqueeze(0)
+                * (1.0 + scale.unsqueeze(1))
+                + shift.unsqueeze(1)
+            )
 
-        return F.normalize(
-            triplet_features,
-            dim=-1,
-        )
+            return F.normalize(
+                triplet_features,
+                dim=-1,
+                eps=1e-6,
+            )
 
     def generate_pair_indices(self, labels: Tensor):
         """Generate directed relation pairs for the active dataset."""
@@ -612,7 +642,8 @@ class LAIN(nn.Module):
         )
         logits = torch.cat(logits)
         logits = logits[x, y]
-        prior = prior[x, y]
+        prior = prior[x, y].float()
+        logits = logits.float()
         labels = labels[x, y]
 
         n_p = torch.count_nonzero(labels)
