@@ -124,6 +124,29 @@ class LAIN(nn.Module):
 
         self.query_proj = MLP(512, 128, 768, 2)
 
+        if self.dataset == "vg":
+            # [SGG compositional text]
+            # Build a cheap ordered S-O condition from frozen VG object
+            # text embeddings. The condition modulates the 50 learned
+            # predicate features instead of re-encoding every literal
+            # S-P-O sentence with the CLIP text transformer.
+            self.triplet_pair_composer = MLP(
+                self.visual_output_dim * 4,
+                self.visual_output_dim,
+                self.visual_output_dim * 2,
+                2,
+            )
+
+            # Start close to the original predicate text features while
+            # retaining a small, direction-sensitive S-O contribution.
+            nn.init.normal_(
+                self.triplet_pair_composer.layers[-1].weight,
+                std=1e-3,
+            )
+            nn.init.zeros_(
+                self.triplet_pair_composer.layers[-1].bias
+            )
+
     def _reset_parameters(self):  ## xxx
         for p in self.context_aware.parameters():
             if p.dim() > 1:
@@ -165,12 +188,13 @@ class LAIN(nn.Module):
         # pairwise_tokens_collated = []
         all_logits = []
 
-        # Get the original fixed text embeddings for HOI datasets.
-        # [SGG dynamic prompt]
-        # VG text depends on each S-O pair and is therefore built inside
-        # the image loop after pair indices are known.
+        # Encode the active predicate vocabulary once per forward pass.
+        # [SGG compositional text]
+        # VG reuses these 50 predicate features for every directed S-O
+        # pair; only the inexpensive pair-conditioned composition happens
+        # inside the image loop.
         text_features = None
-        if self.args.use_prompt and self.dataset != "vg":
+        if self.args.use_prompt:
             if not self.training:
                 if self.tp is None: # when evaluation, compute text embeds once.
                     prompts = self.clip_head.prompt_learner()
@@ -219,30 +243,13 @@ class LAIN(nn.Module):
                 continue
 
             if self.dataset == "vg":
-                # [SGG dynamic prompt]
-                # Expand each directed S-O pair over the active predicate
-                # vocabulary and encode literal S-P-O text in chunks.
-                triplet_prompts, predicate_indices = (
-                    self.build_vg_triplet_prompts(
-                        labels[x_keep],
-                        labels[y_keep],
-                    )
-                )
-
-                text_features = self.clip_head.encode_dynamic_text(
-                    classnames=triplet_prompts,
-                    class_indices=predicate_indices,
-                    chunk_size=self.args.text_prompt_batch_size,
-                    use_checkpoint=self.training,
-                )
-                text_features = text_features / text_features.norm(
-                    dim=-1,
-                    keepdim=True,
-                )
-                text_features = text_features.view(
-                    len(x_keep),
-                    len(self.predicate_class_names),
-                    -1,
+                # [SGG compositional text]
+                # Produce [num_pairs, num_predicates, text_dim] prototypes
+                # without running the CLIP text transformer per triplet.
+                pair_text_features = self.compose_vg_text_features(
+                    labels[x_keep],
+                    labels[y_keep],
+                    text_features,
                 )
 
             if self.args.use_hotoken:
@@ -269,13 +276,13 @@ class LAIN(nn.Module):
 
 
             if self.dataset == "vg":
-                # [SGG dynamic prompt]
-                # Every visual pair is compared only with its own 50
-                # literal S-P-O text features.
+                # [SGG compositional text]
+                # Compare each visual pair with its 50 pair-conditioned
+                # predicate prototypes.
                 logits_text = torch.einsum(
                     "bpd,pcd->bpc",
                     global_feat,
-                    text_features,
+                    pair_text_features,
                 )
             else:
                 logits_text = global_feat @ text_features.T
@@ -290,6 +297,93 @@ class LAIN(nn.Module):
             all_logits.append(logits)
 
         return all_logits, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated
+
+    def compose_vg_text_features(
+        self,
+        subject_labels: Tensor,
+        object_labels: Tensor,
+        predicate_features: Tensor,
+    ) -> Tensor:
+        """Compose ordered VG S-P-O text prototypes without literal text."""
+        # [SGG compositional text]
+        # Subject and object occupy different ordered positions. Their
+        # difference and elementwise product add directional and pairwise
+        # information before FiLM modulation of predicate text features.
+        if self.dataset != "vg":
+            raise RuntimeError(
+                "VG text composition was called for a non-VG dataset"
+            )
+        if len(subject_labels) != len(object_labels):
+            raise ValueError(
+                "VG subject/object pair counts do not match"
+            )
+        if predicate_features.ndim != 2:
+            raise ValueError(
+                "Predicate features must have shape "
+                "[num_predicates, text_dim]"
+            )
+        if predicate_features.shape[0] != self.num_classes:
+            raise ValueError(
+                "VG predicate feature count mismatch: "
+                f"features={predicate_features.shape[0]}, "
+                f"num_classes={self.num_classes}"
+            )
+
+        num_object_classes = self.object_embedding.shape[0]
+        if len(subject_labels) > 0:
+            minimum_label = min(
+                subject_labels.min().item(),
+                object_labels.min().item(),
+            )
+            maximum_label = max(
+                subject_labels.max().item(),
+                object_labels.max().item(),
+            )
+            if minimum_label < 0 or maximum_label >= num_object_classes:
+                raise ValueError(
+                    "VG pair label is outside the object vocabulary: "
+                    f"min={minimum_label}, max={maximum_label}, "
+                    f"num_objects={num_object_classes}"
+                )
+
+        object_vocabulary_features = F.normalize(
+            self.object_embedding.to(predicate_features.dtype),
+            dim=-1,
+        )
+        subject_features = object_vocabulary_features[
+            subject_labels.long()
+        ]
+        object_features = object_vocabulary_features[
+            object_labels.long()
+        ]
+
+        ordered_pair_features = torch.cat(
+            [
+                subject_features,
+                object_features,
+                subject_features - object_features,
+                subject_features * object_features,
+            ],
+            dim=-1,
+        )
+        modulation = self.triplet_pair_composer(
+            ordered_pair_features
+        )
+        scale, shift = modulation.chunk(2, dim=-1)
+
+        # Bounded scaling prevents the newly initialized composer from
+        # overwhelming the pretrained CLIP predicate representation.
+        scale = torch.tanh(scale)
+        triplet_features = (
+            predicate_features.unsqueeze(0)
+            * (1.0 + scale.unsqueeze(1))
+            + shift.unsqueeze(1)
+        )
+
+        return F.normalize(
+            triplet_features,
+            dim=-1,
+        )
 
     def generate_pair_indices(self, labels: Tensor):
         """Generate directed relation pairs for the active dataset."""
