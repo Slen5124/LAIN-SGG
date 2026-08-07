@@ -150,7 +150,10 @@ class CustomisedDLE(DistributedLearningEngine):
                     )
                 )
                 self.save_checkpoint()
-                wandb.log(metrics)
+                # [Incidental logging]
+                # Debug runs have no active W&B run.
+                if wandb.run is not None:
+                    wandb.log(metrics)
             return
 
 
@@ -166,7 +169,8 @@ class CustomisedDLE(DistributedLearningEngine):
                 'sc2': b[1]
             }
 
-            wandb.log(mAPs)
+            if wandb.run is not None:
+                wandb.log(mAPs)
             return
             # raise NotImplementedError(f"Evaluation on V-COCO has not been implemented.")
         ap = self.test_hico(self.test_loader, self.args)
@@ -212,7 +216,8 @@ class CustomisedDLE(DistributedLearningEngine):
                 )
 
             self.save_checkpoint()
-            wandb.log(mAPs)
+            if wandb.run is not None:
+                wandb.log(mAPs)
 
     @torch.no_grad()
     def test_vg(self, dataloader):
@@ -346,7 +351,7 @@ class CustomisedDLE(DistributedLearningEngine):
                             scores[det_idx].view(-1)
                         )
                         # all_det_idxs.append(det_idx)
-                # meter.append(scores, interactions, labels)   # scores human*object*verb, interaction竊?00), labels
+                # Legacy HICO AP accumulation occurs after DDP gather.
                 results = (scores, interactions, labels)
                 pred_list.append(results)
 

@@ -988,7 +988,10 @@ class LAIN(nn.Module):
                 interaction_loss=interaction_loss
             )
 
-            if self.args.local_rank == 0:
+            # [Incidental logging]
+            # Debug runs intentionally skip wandb.init(), so only log when
+            # an active run exists. This does not affect the loss tensor.
+            if self.args.local_rank == 0 and wandb.run is not None:
                 wandb.log(loss_dict)
 
             return loss_dict

@@ -97,8 +97,26 @@ def main(rank, args):
 
     if os.path.exists(args.resume):
         print(f"===>>> Rank {rank}: continue from saved checkpoint {args.resume}")
-        checkpoint = torch.load(args.resume, map_location='cpu')
-        lain.load_state_dict(checkpoint['model_state_dict'],strict=False)
+        checkpoint = torch.load(
+            args.resume,
+            map_location='cpu',
+            weights_only=False,
+        )
+        if args.dataset == 'vg':
+            # [VG checkpoint integrity]
+            # The canonical VG architecture must match its checkpoint
+            # exactly; do not hide missing relation-composer parameters.
+            lain.load_state_dict(
+                checkpoint['model_state_dict'],
+                strict=True,
+            )
+            print('[INFO] VG checkpoint strict model load: OK')
+        else:
+            # Original flexible loading for legacy HICO/V-COCO checkpoints.
+            lain.load_state_dict(
+                checkpoint['model_state_dict'],
+                strict=False,
+            )
     else:
         print(f"=> Rank {rank}: start from a randomly initialised model")
 
@@ -205,14 +223,44 @@ def main(rank, args):
     )
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optim, args.lr_drop)
 
+    completed_epochs = 0
+
     if args.resume:
-        # optim.load_state_dict(checkpoint['optim_state_dict'])
-        # lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        epoch=checkpoint['epoch']
+        # [Training resume]
+        # Restore optimization state as well as model parameters so LR,
+        # Adam moments, epoch, and global iteration continue exactly.
+        optim.load_state_dict(checkpoint['optim_state_dict'])
+        lr_scheduler.load_state_dict(
+            checkpoint['scheduler_state_dict']
+        )
+        epoch = checkpoint['epoch']
         iteration = checkpoint['iteration']
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler, epoch=epoch,iteration=iteration, scaler=scaler)
+        completed_epochs = epoch
+
+        if args.amp:
+            engine.scaler.load_state_dict(
+                checkpoint['scaler_state_dict']
+            )
+            engine.update_state_key(
+                optimizer=optim,
+                lr_scheduler=lr_scheduler,
+                epoch=epoch,
+                iteration=iteration,
+                scaler=engine.scaler,
+            )
+        else:
+            engine.update_state_key(
+                optimizer=optim,
+                lr_scheduler=lr_scheduler,
+                epoch=epoch,
+                iteration=iteration,
+            )
+
+        print(
+            '[INFO] training state restored: '
+            f'epoch={epoch}, iteration={iteration}, '
+            f'lr={lr_scheduler.get_last_lr()}'
+        )
     else:
         engine.update_state_key(optimizer=optim, lr_scheduler=lr_scheduler)
 
@@ -221,7 +269,23 @@ def main(rank, args):
         json.dump(args.__dict__, f, indent=2)
     f.close()
 
-    engine(args.epochs)
+    # [Training resume]
+    # Pocket's engine argument is the number of epochs to run from the current
+    # state, while --epochs denotes the target total epoch in this project.
+    remaining_epochs = max(args.epochs - completed_epochs, 0)
+    if remaining_epochs == 0:
+        print(
+            '[INFO] training skipped: '
+            f'target epoch={args.epochs} is already complete '
+            f'(checkpoint epoch={completed_epochs})'
+        )
+    else:
+        print(
+            '[INFO] training plan: '
+            f'completed={completed_epochs}, target={args.epochs}, '
+            f'remaining={remaining_epochs}'
+        )
+        engine(remaining_epochs)
 
 if __name__ == '__main__':
     args = get_args()
