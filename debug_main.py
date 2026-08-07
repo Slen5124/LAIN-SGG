@@ -131,6 +131,17 @@ def main(rank, args):
     
     if args.eval:
         lain.eval()
+        if args.dataset == 'vg':
+            metrics = engine.test_vg(test_loader)
+            if rank == 0:
+                print(
+                    'VG SGDet: '
+                    + ', '.join(
+                        f'{key}={value * 100:.2f}'
+                        for key, value in metrics.items()
+                    )
+                )
+            return
         if args.dataset == 'vcoco':
             import eval_vcoco
             ret = engine.cache_vcoco(test_loader)
@@ -236,8 +247,17 @@ if __name__ == '__main__':
     os.environ["MASTER_ADDR"] = "localhost"
     local_rank = int(os.environ.get("LOCAL_RANK",0))
     args.local_rank = local_rank
-    if local_rank == 0:
+    # [Debug startup]
+    # Disabled debug runs must not wait for the external W&B service.
+    if local_rank == 0 and not args.debug:
         wandb.init(project='LAIN', name=args.output_dir)
 
     args.world_size = int(os.environ.get("WORLD_SIZE",1))
-    main(local_rank,args)
+
+    # [Distributed cleanup]
+    # Release NCCL resources after training, evaluation, or an early return.
+    try:
+        main(local_rank,args)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()

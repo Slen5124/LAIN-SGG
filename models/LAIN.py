@@ -997,17 +997,37 @@ class LAIN(nn.Module):
             print(targets)
             return None
 
-        detections = self.postprocessing(boxes, bh, bo, logits, prior, objects, image_sizes)
+        detections = self.postprocessing(
+            boxes,
+            bh,
+            bo,
+            logits,
+            prior,
+            objects,
+            proposal_labels,
+            image_sizes,
+        )
         return detections
 
-    def postprocessing(self, boxes, bh, bo, logits, prior, objects, image_sizes):
+    def postprocessing(
+        self,
+        boxes,
+        bh,
+        bo,
+        logits,
+        prior,
+        objects,
+        proposal_labels,
+        image_sizes,
+    ):
         n = [len(b) for b in bh]
         logits = torch.cat(logits)
         logits = logits.split(n)
 
         detections = []
-        for bx, h, o, lg, pr, obj, size,  in zip(
-                boxes, bh, bo, logits, prior, objects, image_sizes,
+        for bx, h, o, lg, pr, obj, prop_labels, size in zip(
+                boxes, bh, bo, logits, prior, objects,
+                proposal_labels, image_sizes,
         ):
             pr = pr.prod(0)
             x, y = torch.nonzero(pr).unbind(1)
@@ -1016,6 +1036,11 @@ class LAIN(nn.Module):
             detections.append(dict(
                 boxes=bx, pairing=torch.stack([h[x], o[x]]),
                 scores=scores * pr[x, y], labels=y,
+                # [SGG evaluation]
+                # Passing fields: expose both endpoint classes so SGDet
+                # evaluation can match complete S-P-O triplets. Existing
+                # HICO consumers continue to use the unchanged objects key.
+                subjects=prop_labels[h[x]],
                 objects=obj[x], size=size
             ))
 

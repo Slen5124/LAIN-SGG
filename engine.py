@@ -16,6 +16,10 @@ from tqdm import tqdm
 from collections import defaultdict
 
 from utils.hico_text_label import hico_unseen_index
+from utils.vg_evaluator import (
+    evaluate_vg_image_recall,
+    summarize_vg_recall,
+)
 import utils.ddp as ddp
 import pocket
 from pocket.core import DistributedLearningEngine
@@ -121,6 +125,34 @@ class CustomisedDLE(DistributedLearningEngine):
             self._state.lr_scheduler.step()
         self.net.object_class_to_target_class = self.test_loader.dataset.dataset.object_class_to_target_class
 
+        if self.args.dataset == 'vg':
+            # [SGG evaluation]
+            # VG uses graph-constrained SGDet Recall@K instead of the
+            # HICO interaction AP path below.
+            metrics = self.test_vg(self.test_loader)
+
+            # [Incidental cache management]
+            # Evaluation caches predicate text features. Clear the cache
+            # so later epochs evaluate the newly updated prompt context.
+            model = (
+                self.net.module
+                if hasattr(self.net, 'module')
+                else self.net
+            )
+            model.tp = None
+
+            if self._rank == 0:
+                print(
+                    'VG SGDet: '
+                    + ', '.join(
+                        f'{key}={value * 100:.2f}'
+                        for key, value in metrics.items()
+                    )
+                )
+                self.save_checkpoint()
+                wandb.log(metrics)
+            return
+
 
         if self.args.dataset == 'vcoco':
             ret = self.cache_vcoco(self.test_loader)
@@ -181,6 +213,70 @@ class CustomisedDLE(DistributedLearningEngine):
 
             self.save_checkpoint()
             wandb.log(mAPs)
+
+    @torch.no_grad()
+    def test_vg(self, dataloader):
+        """Evaluate graph-constrained VG SGDet Recall@20/50/100."""
+        net = self._state.net
+        net.eval()
+        image_results = []
+
+        for batch in tqdm(dataloader):
+            inputs = pocket.ops.relocate_to_cuda(batch[0])
+            targets = batch[1]
+            outputs = net(inputs, targets)
+
+            # [SGG evaluation robustness]
+            # Missing detections contribute zero recall instead of being
+            # skipped, which would bias the reported metric upward.
+            if outputs is None or len(outputs) == 0:
+                outputs = [
+                    {
+                        'boxes': torch.zeros(0, 4),
+                        'pairing': torch.zeros(
+                            2,
+                            0,
+                            dtype=torch.long,
+                        ),
+                        'scores': torch.zeros(0),
+                        'labels': torch.zeros(
+                            0,
+                            dtype=torch.long,
+                        ),
+                        'subjects': torch.zeros(
+                            0,
+                            dtype=torch.long,
+                        ),
+                        'objects': torch.zeros(
+                            0,
+                            dtype=torch.long,
+                        ),
+                    }
+                    for _ in targets
+                ]
+
+            for output, target in zip(outputs, targets):
+                output = pocket.ops.relocate_to_cpu(
+                    output,
+                    ignore=True,
+                )
+                result = evaluate_vg_image_recall(
+                    detection=output,
+                    target=target,
+                    recall_k=(20, 50, 100),
+                    iou_threshold=0.5,
+                )
+                if result is not None:
+                    image_results.append(result)
+
+        gathered_results = []
+        for rank_results in ddp.all_gather(image_results):
+            gathered_results.extend(rank_results)
+
+        return summarize_vg_recall(
+            gathered_results,
+            recall_k=(20, 50, 100),
+        )
 
     @torch.no_grad()
     def test_hico(self, dataloader, args=None):
@@ -250,7 +346,7 @@ class CustomisedDLE(DistributedLearningEngine):
                             scores[det_idx].view(-1)
                         )
                         # all_det_idxs.append(det_idx)
-                # meter.append(scores, interactions, labels)   # scores human*object*verb, interaction（600), labels
+                # meter.append(scores, interactions, labels)   # scores human*object*verb, interaction竊?00), labels
                 results = (scores, interactions, labels)
                 pred_list.append(results)
 
