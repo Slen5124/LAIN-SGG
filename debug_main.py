@@ -59,13 +59,32 @@ def main(rank, args):
                             num_classes=args.num_classes,
                             args=args,)
 
-    class _Debug20(type(trainset)):
-        def __len__(self): return 20
-    trainset.__class__ = _Debug20
-    class _DebugTest20(type(testset)):
-        def __len__(self): return 20
-    testset.__class__ = _DebugTest20
-    print(f'[DEBUG] trainset len -> {len(trainset)}')
+    # [Configurable debug subset]
+    # Keep the original DataFactory interface and expose only the requested
+    # prefix. Dataset loading, annotations, and augmentations remain unchanged.
+    if args.debug_samples <= 0:
+        raise ValueError(
+            '--debug-samples must be a positive integer, '
+            f'got {args.debug_samples}'
+        )
+
+    train_debug_size = min(args.debug_samples, len(trainset))
+    test_debug_size = min(args.debug_samples, len(testset))
+
+    class _DebugTrainSubset(type(trainset)):
+        def __len__(self):
+            return train_debug_size
+
+    class _DebugTestSubset(type(testset)):
+        def __len__(self):
+            return test_debug_size
+
+    trainset.__class__ = _DebugTrainSubset
+    testset.__class__ = _DebugTestSubset
+    print(
+        '[DEBUG] dataset lengths: '
+        f'train={len(trainset)}, test={len(testset)}'
+    )
 
     # if args.dataset == 'vcoco':
     #     object_n_verb_to_interaction = vcoco_object_n_verb_to_interaction(num_object_cls=len(trainset.dataset.objects), num_action_cls=len(trainset.dataset.actions), class_corr=class_corr)

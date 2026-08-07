@@ -233,6 +233,15 @@ def get_args():
     parser.add_argument('--job_id', default=1985, type=int)
     parser.add_argument('--vis', action='store_true')
     parser.add_argument('--debug', default=False, action='store_true')
+    parser.add_argument(
+        '--debug-samples',
+        default=20,
+        type=int,
+        help=(
+            'Number of train and test images exposed by debug_main.py. '
+            'This changes only debug run scale, not the VG split.'
+        ),
+    )
     parser.add_argument('--seed', default=66, type=int)
     parser.add_argument(
         '--device',
