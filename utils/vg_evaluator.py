@@ -1,3 +1,4 @@
+
 """Visual Genome SGDet Recall@K evaluation utilities.
 
 The evaluator follows the graph-constrained Visual Genome protocol used by
@@ -14,6 +15,38 @@ from torchvision.ops import box_iou
 
 
 DEFAULT_RECALL_K = (20, 50, 100)
+
+
+def _validate_ovr_predicate_partition(
+    base_predicate_indices: Sequence[int],
+    novel_predicate_indices: Sequence[int],
+) -> tuple:
+    """Validate and normalize the Base/Novel OvR predicate partition."""
+    base = tuple(int(index) for index in base_predicate_indices)
+    novel = tuple(int(index) for index in novel_predicate_indices)
+
+    if not base or not novel:
+        raise ValueError(
+            "VG OvR evaluation requires non-empty Base and Novel splits"
+        )
+
+    if len(set(base)) != len(base):
+        raise ValueError("VG OvR Base predicate indices contain duplicates")
+
+    if len(set(novel)) != len(novel):
+        raise ValueError("VG OvR Novel predicate indices contain duplicates")
+
+    overlap = sorted(set(base) & set(novel))
+    if overlap:
+        raise ValueError(
+            "VG OvR Base and Novel predicate indices overlap: "
+            f"{overlap}"
+        )
+
+    if min(base + novel) < 0:
+        raise ValueError("VG OvR predicate indices must be non-negative")
+
+    return base, novel
 
 
 def _recover_target_boxes(boxes: Tensor, size: Tensor) -> Tensor:
@@ -126,13 +159,40 @@ def evaluate_vg_image_recall(
     target: Dict[str, Tensor],
     recall_k: Sequence[int] = DEFAULT_RECALL_K,
     iou_threshold: float = 0.5,
+    base_predicate_indices: Optional[Sequence[int]] = None,
+    novel_predicate_indices: Optional[Sequence[int]] = None,
 ) -> Optional[Dict[str, object]]:
-    """Evaluate graph-constrained SGDet Recall@K for one VG image."""
+    """Evaluate graph-constrained SGDet Recall@K for one VG image.
+
+    The fully-supervised path returns the original overall Recall@K fields.
+    When both OvR predicate splits are provided, the same global prediction
+    ranking is additionally evaluated against Base and Novel GT subsets.
+    """
     if not 0.0 <= iou_threshold <= 1.0:
         raise ValueError("iou_threshold must be in [0, 1]")
     recall_k = tuple(sorted(set(int(k) for k in recall_k)))
     if not recall_k or recall_k[0] <= 0:
         raise ValueError("recall_k must contain positive integers")
+
+    # [VG OvR evaluation mode]
+    # Both splits must be supplied together. Keeping this opt-in preserves the
+    # original fully-supervised evaluator contract.
+    has_base_split = base_predicate_indices is not None
+    has_novel_split = novel_predicate_indices is not None
+
+    if has_base_split != has_novel_split:
+        raise ValueError(
+            "Base and Novel predicate indices must be provided together"
+        )
+
+    ovr_enabled = has_base_split and has_novel_split
+    if ovr_enabled:
+        base_predicate_indices, novel_predicate_indices = (
+            _validate_ovr_predicate_partition(
+                base_predicate_indices,
+                novel_predicate_indices,
+            )
+        )
 
     required_target = {
         "boxes_h",
@@ -175,6 +235,47 @@ def evaluate_vg_image_recall(
     gt_object = target["object"].to(device).long()
     gt_predicate = target["verb"].to(device).long()
 
+    base_gt_mask = None
+    novel_gt_mask = None
+    num_base_ground_truth = None
+    num_novel_ground_truth = None
+
+    if ovr_enabled:
+        # [VG OvR GT partition]
+        # Partition only the denominator. Prediction ranking remains the same
+        # 50-class graph-constrained ranking used for overall Recall@K.
+        base_index_tensor = torch.as_tensor(
+            base_predicate_indices,
+            dtype=torch.long,
+            device=device,
+        )
+        novel_index_tensor = torch.as_tensor(
+            novel_predicate_indices,
+            dtype=torch.long,
+            device=device,
+        )
+        base_gt_mask = torch.isin(
+            gt_predicate,
+            base_index_tensor,
+        )
+        novel_gt_mask = torch.isin(
+            gt_predicate,
+            novel_index_tensor,
+        )
+
+        covered_gt = base_gt_mask | novel_gt_mask
+        if not torch.all(covered_gt):
+            uncovered = torch.unique(
+                gt_predicate[~covered_gt]
+            ).tolist()
+            raise ValueError(
+                "VG OvR evaluation found predicates outside the "
+                f"Base/Novel partition: {uncovered}"
+            )
+
+        num_base_ground_truth = int(base_gt_mask.sum().item())
+        num_novel_ground_truth = int(novel_gt_mask.sum().item())
+
     if len(ranked_indices) == 0:
         matched_by_prediction = torch.zeros(
             0,
@@ -209,6 +310,11 @@ def evaluate_vg_image_recall(
 
     recall = {}
     matched = {}
+    base_recall = {}
+    novel_recall = {}
+    base_matched = {}
+    novel_matched = {}
+
     for k in recall_k:
         top_matches = matched_by_prediction[:k]
         matched_gt = (
@@ -224,26 +330,127 @@ def evaluate_vg_image_recall(
         matched[k] = matched_count
         recall[k] = matched_count / num_ground_truth
 
-    return {
+        if ovr_enabled:
+            matched_base_count = int(
+                (matched_gt & base_gt_mask).sum().item()
+            )
+            matched_novel_count = int(
+                (matched_gt & novel_gt_mask).sum().item()
+            )
+            base_matched[k] = matched_base_count
+            novel_matched[k] = matched_novel_count
+
+            # None marks an image without GT from that subset. Such images
+            # must be skipped rather than counted as zero subset recall.
+            base_recall[k] = (
+                matched_base_count / num_base_ground_truth
+                if num_base_ground_truth > 0
+                else None
+            )
+            novel_recall[k] = (
+                matched_novel_count / num_novel_ground_truth
+                if num_novel_ground_truth > 0
+                else None
+            )
+
+    result = {
         "recall": recall,
         "matched": matched,
         "num_gt": num_ground_truth,
         "num_ranked_predictions": len(ranked_indices),
     }
 
+    if ovr_enabled:
+        result.update(
+            {
+                "base_recall": base_recall,
+                "novel_recall": novel_recall,
+                "base_matched": base_matched,
+                "novel_matched": novel_matched,
+                "num_base_gt": num_base_ground_truth,
+                "num_novel_gt": num_novel_ground_truth,
+            }
+        )
+
+    return result
+
 
 def summarize_vg_recall(
     image_results: Iterable[Dict[str, object]],
     recall_k: Sequence[int] = DEFAULT_RECALL_K,
+    include_ovr: bool = False,
 ) -> Dict[str, float]:
-    """Average per-image Recall@K, matching the standard VG protocol."""
+    """Average per-image Recall@K, preserving the standard VG protocol."""
     recall_k = tuple(sorted(set(int(k) for k in recall_k)))
     results = list(image_results)
-    if not results:
-        return {f"R@{k}": 0.0 for k in recall_k}
 
-    return {
-        f"R@{k}": sum(result["recall"][k] for result in results)
-        / len(results)
+    if not results:
+        summary = {
+            f"R@{k}": 0.0
+            for k in recall_k
+        }
+        if include_ovr:
+            summary.update(
+                {
+                    f"bR@{k}": 0.0
+                    for k in recall_k
+                }
+            )
+            summary.update(
+                {
+                    f"zR@{k}": 0.0
+                    for k in recall_k
+                }
+            )
+        return summary
+
+    summary = {
+        f"R@{k}": sum(
+            result["recall"][k]
+            for result in results
+        ) / len(results)
         for k in recall_k
     }
+
+    ovr_flags = [
+        (
+            "base_recall" in result
+            and "novel_recall" in result
+        )
+        for result in results
+    ]
+
+    if any(ovr_flags) and not all(ovr_flags):
+        raise ValueError(
+            "VG evaluator received a mixture of OvR and "
+            "fully-supervised image results"
+        )
+
+    has_ovr_results = all(ovr_flags)
+    if include_ovr and not has_ovr_results:
+        raise ValueError(
+            "OvR summary was requested but image results do not contain "
+            "Base/Novel recall"
+        )
+
+    if has_ovr_results:
+        include_ovr = True
+
+    if include_ovr:
+        for subset_name, metric_prefix in (
+            ("base_recall", "bR"),
+            ("novel_recall", "zR"),
+        ):
+            for k in recall_k:
+                valid_values = [
+                    result[subset_name][k]
+                    for result in results
+                    if result[subset_name][k] is not None
+                ]
+                summary[f"{metric_prefix}@{k}"] = (
+                    sum(valid_values) / len(valid_values)
+                    if valid_values
+                    else 0.0
+                )
+
+    return summary

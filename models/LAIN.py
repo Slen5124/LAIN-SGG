@@ -102,6 +102,57 @@ class LAIN(nn.Module):
         self.num_classes = num_classes
 
         self.dataset = args.dataset
+
+        # [VG OvR supervision]
+        # Preserve every existing dataset path by enabling predicate masking
+        # only for the explicit --vg-ovr configuration.
+        self.vg_ovr = bool(
+            getattr(args, "vg_ovr", False)
+        )
+
+        if self.vg_ovr and self.dataset != "vg":
+            raise ValueError(
+                "--vg-ovr can only be used with --dataset vg"
+            )
+
+        if self.vg_ovr and self.num_classes != 50:
+            raise ValueError(
+                "VG OvR requires the complete 50-predicate vocabulary, "
+                f"got num_classes={self.num_classes}."
+            )
+
+        # This non-persistent mask follows the model device but does not alter
+        # the checkpoint contract of existing LAIN models.
+        vg_base_predicate_mask = torch.ones(
+            self.num_classes,
+            dtype=torch.bool,
+        )
+        self.vg_base_predicate_indices = tuple()
+        self.vg_novel_predicate_indices = tuple()
+
+        if self.vg_ovr:
+            from utils.vg_list import VG150_PREDICATES
+            from utils.vg_ov_split import (
+                resolve_ovsgtr_predicate_split,
+            )
+
+            predicate_split = resolve_ovsgtr_predicate_split(
+                VG150_PREDICATES
+            )
+            self.vg_base_predicate_indices = predicate_split["base"]
+            self.vg_novel_predicate_indices = predicate_split["novel"]
+
+            vg_base_predicate_mask.zero_()
+            vg_base_predicate_mask[
+                list(self.vg_base_predicate_indices)
+            ] = True
+
+        self.register_buffer(
+            "vg_base_predicate_mask",
+            vg_base_predicate_mask,
+            persistent=False,
+        )
+
         self.hyper_lambda = args.hyper_lambda
 
         self.use_insadapter = args.use_insadapter
@@ -568,6 +619,23 @@ class LAIN(nn.Module):
                     f"num_classes={self.num_classes}"
                 )
 
+            if self.vg_ovr:
+                # [VG OvR target safety]
+                # Dataset filtering should prevent novel predicates from
+                # reaching training targets. Fail loudly if that contract is
+                # violated instead of silently training on novel positives.
+                base_mask = self.vg_base_predicate_mask[
+                    selected_predicates
+                ]
+                if not torch.all(base_mask):
+                    leaked_predicates = torch.unique(
+                        selected_predicates[~base_mask]
+                    ).tolist()
+                    raise ValueError(
+                        "VG OvR training target contains novel predicates: "
+                        f"{leaked_predicates}"
+                    )
+
             # Repeated assignments preserve multiple predicates attached
             # to the same directed subject-object pair.
             labels[
@@ -640,6 +708,17 @@ class LAIN(nn.Module):
             prior,
             as_tuple=True,
         )
+
+        if self.vg_ovr:
+            # [VG OvR loss masking]
+            # Novel predicate columns must be ignored completely. Merely
+            # removing novel positive annotations would otherwise turn every
+            # novel predicate into a negative target in the sigmoid focal
+            # loss and invalidate zero-shot evaluation.
+            keep_base = self.vg_base_predicate_mask[y]
+            x = x[keep_base]
+            y = y[keep_base]
+
         logits = torch.cat(logits)
         logits = logits[x, y]
         prior = prior[x, y].float()
@@ -1108,6 +1187,19 @@ def build_detector(
                 "--use_prompt is required for VG compositional text"
             )
 
+        if (
+            getattr(args, "vg_ovr", False)
+            and args.CSC
+        ):
+            # [VG OvR shared prompt]
+            # Class-specific contexts leave novel predicates with untrained
+            # random context parameters. A shared context is learned from base
+            # predicates and can be applied to novel predicate names.
+            raise ValueError(
+                "VG OvR requires a shared prompt context. "
+                "Run with --use_prompt and omit --CSC."
+            )
+
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(
                 "Load the EGTR VG detector from "
@@ -1182,8 +1274,11 @@ def build_detector(
         )
 
         # [SGG compositional text]
-        # Learn one context per bare predicate. Ordered subject/object
-        # information is injected later by the lightweight pair composer.
+        # Fully-supervised VG may use the configured class-specific context.
+        # VG OvR uses one shared context (CSC=False), learned from base
+        # predicates and reused for novel predicate names. Ordered
+        # subject/object information is injected later by the lightweight
+        # pair composer in both paths.
         classnames = list(VG150_PREDICATES)
 
     else:

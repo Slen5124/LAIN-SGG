@@ -100,7 +100,12 @@ class CustomisedDLE(DistributedLearningEngine):
                 "Epoch [{}/{}], Iter. [{}/{}], "
                 "Loss: {:.4f}, "
                 "Time[Data/Iter./Remain.]: [{:.2f}s/{:.2f}s/{}]".format(
-                self._state.epoch, self.epochs,
+                    # [Resume-aware progress display]
+                    # ``self.epochs`` is the number of remaining epochs passed
+                    # to Pocket's engine. ``args.epochs`` is the intended total
+                    # target, so it keeps resumed logs consistent (for example,
+                    # Epoch [2/2] instead of Epoch [2/1]).
+                    self._state.epoch, self.args.epochs,
                 str(current_iter).zfill(n_d),
                 num_iter, running_loss, t_data, t_iter,  datetime.timedelta(seconds=(num_iter-current_iter)*it_sec)
             ))
@@ -260,6 +265,39 @@ class CustomisedDLE(DistributedLearningEngine):
         net.eval()
         image_results = []
 
+        # [VG OvR evaluation split]
+        # DataFactory is the outer dataset and VGDataset is stored in its
+        # ``dataset`` attribute. Reuse the official name-resolved split that
+        # VGDataset already constructed instead of duplicating indices here.
+        vg_dataset = dataloader.dataset.dataset
+        use_vg_ovr = bool(getattr(self.args, 'vg_ovr', False))
+
+        if use_vg_ovr:
+            base_predicate_indices = tuple(
+                vg_dataset.base_predicate_indices
+            )
+            novel_predicate_indices = tuple(
+                vg_dataset.novel_predicate_indices
+            )
+
+            # [Evaluation contract]
+            # Fail before the evaluation loop if the active dataset was not
+            # built with the expected official Base-35/Novel-15 partition.
+            if len(base_predicate_indices) != 35:
+                raise ValueError(
+                    'VG OvR evaluation requires 35 Base predicates, '
+                    f'got {len(base_predicate_indices)}.'
+                )
+            if len(novel_predicate_indices) != 15:
+                raise ValueError(
+                    'VG OvR evaluation requires 15 Novel predicates, '
+                    f'got {len(novel_predicate_indices)}.'
+                )
+        else:
+            # Preserve the original fully-supervised VG evaluator contract.
+            base_predicate_indices = None
+            novel_predicate_indices = None
+
         for batch in tqdm(dataloader):
             inputs = pocket.ops.relocate_to_cuda(batch[0])
             targets = batch[1]
@@ -304,6 +342,12 @@ class CustomisedDLE(DistributedLearningEngine):
                     target=target,
                     recall_k=(20, 50, 100),
                     iou_threshold=0.5,
+                    base_predicate_indices=(
+                        base_predicate_indices
+                    ),
+                    novel_predicate_indices=(
+                        novel_predicate_indices
+                    ),
                 )
                 if result is not None:
                     image_results.append(result)
@@ -315,6 +359,7 @@ class CustomisedDLE(DistributedLearningEngine):
         return summarize_vg_recall(
             gathered_results,
             recall_k=(20, 50, 100),
+            include_ovr=use_vg_ovr,
         )
 
     @torch.no_grad()

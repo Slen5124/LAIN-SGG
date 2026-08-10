@@ -21,6 +21,12 @@ Verified:
     - boxes_1024 format: [xc, yc, w, h]
     - HDF5 relationships contain global box indices
     - predicate and object labels are converted from 1-based to 0-based
+
+OvR behavior when args.vg_ovr is enabled:
+    - use the official OvSGTR split_GLIPunseen image split
+    - retain only base-predicate relations in training targets
+    - exclude training images that contain no base relation
+    - retain all base and novel relations for test evaluation
 """
 
 import json
@@ -30,6 +36,8 @@ import h5py
 import numpy as np
 import torch
 from PIL import Image
+
+from utils.vg_ov_split import resolve_ovsgtr_predicate_split
 
 
 # Standard corrupted VG images excluded by common VG150 preprocessing.
@@ -64,6 +72,13 @@ class VGDataset:
         self.root = root
         self.split = split
         self.args = args
+
+        # [VG OvR mode]
+        # Keep the fully-supervised VG path unchanged unless explicitly
+        # enabled by --vg-ovr.
+        self.vg_ovr = bool(
+            getattr(args, "vg_ovr", False)
+        )
         self.num_object_cls = 150
         self.num_relation_cls = num_relations
 
@@ -107,6 +122,28 @@ class VGDataset:
                 f"{len(self.idx_to_predicate)}"
             )
 
+        # [Official OvSGTR predicate split]
+        # Resolve names against the active VG dictionary instead of assuming
+        # that predicate indices are always stored in the same order.
+        self.base_predicate_indices = tuple()
+        self.novel_predicate_indices = tuple()
+
+        if self.vg_ovr:
+            predicate_names = [
+                self.idx_to_predicate[str(index + 1)]
+                for index in range(self.num_relation_cls)
+            ]
+            predicate_split = resolve_ovsgtr_predicate_split(
+                predicate_names
+            )
+            self.base_predicate_indices = predicate_split["base"]
+            self.novel_predicate_indices = predicate_split["novel"]
+
+        self.base_predicate_index_array = np.asarray(
+            self.base_predicate_indices,
+            dtype=np.int64,
+        )
+
         # Build image paths in the same order used by VG-SGG.h5.
         with open(image_data_path, encoding="utf-8") as file:
             image_data = json.load(file)
@@ -132,7 +169,23 @@ class VGDataset:
         # Load HDF5 annotations into memory. This avoids retaining an open
         # h5py handle when DataLoader workers are created.
         with h5py.File(h5_path, "r") as file:
-            split_array = file["split"][:]
+            # [Official OvSGTR image split]
+            # The fully-supervised baseline keeps the original split.
+            # OvR uses split_GLIPunseen to exclude test images exposed
+            # during visual-backbone pretraining.
+            self.split_key = (
+                "split_GLIPunseen"
+                if self.vg_ovr
+                else "split"
+            )
+
+            if self.split_key not in file:
+                raise KeyError(
+                    "VG HDF5 is missing the requested split key: "
+                    f"{self.split_key}"
+                )
+
+            split_array = file[self.split_key][:]
             self.boxes = file["boxes_1024"][:]
             self.labels = file["labels"][:]
             self.relationships = file["relationships"][:]
@@ -152,6 +205,7 @@ class VGDataset:
         # Stanford VG150 split codes:
         #     0 = train
         #     2 = test
+        # split_GLIPunseen additionally uses -2 for excluded test images.
         split_code = 0 if split == "train" else 2
 
         self.image_index = []
@@ -166,13 +220,40 @@ class VGDataset:
             if self.img_to_first_rel[image_index] < 0:
                 continue
 
+            # [Base-only OvR training images]
+            # Official OvR training excludes images that contain no base
+            # relation. Test images retain both base and novel relations.
+            if self.vg_ovr and split == "train":
+                first_relation = int(
+                    self.img_to_first_rel[image_index]
+                )
+                last_relation = int(
+                    self.img_to_last_rel[image_index]
+                )
+
+                image_predicates = self.predicates[
+                    first_relation:last_relation + 1
+                ].reshape(-1).astype(np.int64) - 1
+
+                has_base_relation = np.isin(
+                    image_predicates,
+                    self.base_predicate_index_array,
+                ).any()
+
+                if not has_base_relation:
+                    continue
+
             self.image_index.append(image_index)
             self.filenames.append(
                 all_filenames[image_index]
             )
 
+        # [Incidental logging]
+        # This reports which split is active but does not affect samples.
         print(
             f"[VG] split={split}, "
+            f"split_key={self.split_key}, "
+            f"ovr={self.vg_ovr}, "
             f"{len(self.image_index)} images loaded "
             f"(objects={self.num_object_cls}, "
             f"relations={self.num_relation_cls})"
@@ -271,6 +352,27 @@ class VGDataset:
         predicates = self.predicates[
             first_relation:last_relation + 1
         ].squeeze(1)
+
+        # [Base-only OvR train annotations]
+        # Novel relations remain available in the test target, but are not
+        # exposed as positive labels during OvR training.
+        if self.vg_ovr and self.split == "train":
+            predicate_indices = (
+                predicates.astype(np.int64) - 1
+            )
+            keep_base = np.isin(
+                predicate_indices,
+                self.base_predicate_index_array,
+            )
+
+            relationships = relationships[keep_base]
+            predicates = predicates[keep_base]
+
+            if len(predicates) == 0:
+                raise RuntimeError(
+                    "OvR train image contains no base relation after "
+                    "dataset initialization filtering."
+                )
 
         subject_boxes = []
         object_boxes = []

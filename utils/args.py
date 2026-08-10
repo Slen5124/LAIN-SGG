@@ -164,6 +164,17 @@ def get_args():
             'unseen_object',
         ],
     )
+        # [VG open-vocabulary relation split]
+    # This is separate from the original HICO zero-shot configurations.
+    parser.add_argument(
+        "--vg-ovr",
+        action="store_true",
+        help=(
+            "Use the official OvSGTR VG150 relation split: "
+            "train on 35 base predicates and evaluate all 50 predicates "
+            "on split_GLIPunseen."
+        ),
+    )
 
     parser.add_argument('--dataset', default='hicodet', type=str)
     parser.add_argument(
