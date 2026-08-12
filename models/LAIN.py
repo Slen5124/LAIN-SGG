@@ -110,6 +110,34 @@ class LAIN(nn.Module):
             getattr(args, "vg_ovr", False)
         )
 
+        # [VG frozen literal text]
+        # Keep the existing trainable prompt + MLP composition as the default.
+        # The literal-cache path is an explicit ablation that replaces only
+        # the text representation while preserving detector, pair generation,
+        # visual LAIN modules, matching, loss, and evaluation.
+        self.vg_text_mode = getattr(
+            args,
+            "vg_text_mode",
+            "compositional",
+        )
+        self.vg_literal_cache_path = getattr(
+            args,
+            "vg_literal_cache",
+            "",
+        )
+        if self.vg_text_mode not in {
+            "compositional",
+            "literal_cache",
+        }:
+            raise ValueError(
+                "Unsupported VG text mode: "
+                f"{self.vg_text_mode}"
+            )
+        if self.dataset != "vg" and self.vg_text_mode != "compositional":
+            raise ValueError(
+                "Literal S-P-O text cache can only be used with VG"
+            )
+
         if self.vg_ovr and self.dataset != "vg":
             raise ValueError(
                 "--vg-ovr can only be used with --dataset vg"
@@ -150,6 +178,69 @@ class LAIN(nn.Module):
         self.register_buffer(
             "vg_base_predicate_mask",
             vg_base_predicate_mask,
+            persistent=False,
+        )
+
+        # [VG frozen literal text]
+        # A non-persistent buffer follows model.cuda() but is intentionally not
+        # duplicated inside every ~700MB training checkpoint. The external
+        # cache path remains part of args.txt and is required again on resume.
+        vg_literal_text_features = torch.empty(0, dtype=torch.float16)
+        if self.dataset == "vg" and self.vg_text_mode == "literal_cache":
+            if not self.vg_literal_cache_path:
+                raise ValueError(
+                    "--vg-literal-cache is required when "
+                    "--vg-text-mode literal_cache"
+                )
+            if not os.path.isfile(self.vg_literal_cache_path):
+                raise FileNotFoundError(
+                    "VG literal text cache was not found: "
+                    f"{self.vg_literal_cache_path}"
+                )
+
+            cache_payload = torch.load(
+                self.vg_literal_cache_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            if not isinstance(cache_payload, dict):
+                raise ValueError("VG literal cache must contain a dictionary")
+            if "text_features" not in cache_payload:
+                raise ValueError(
+                    "VG literal cache is missing 'text_features'"
+                )
+
+            vg_literal_text_features = cache_payload[
+                "text_features"
+            ]
+            expected_shape = (
+                150,
+                self.num_classes,
+                150,
+                self.visual_output_dim,
+            )
+            if tuple(vg_literal_text_features.shape) != expected_shape:
+                raise ValueError(
+                    "VG literal cache shape mismatch: "
+                    f"expected={expected_shape}, "
+                    f"actual={tuple(vg_literal_text_features.shape)}"
+                )
+            if vg_literal_text_features.dtype != torch.float16:
+                raise ValueError(
+                    "VG literal cache must use FP16, got "
+                    f"{vg_literal_text_features.dtype}"
+                )
+            if not torch.isfinite(vg_literal_text_features).all():
+                raise ValueError(
+                    "VG literal cache contains non-finite values"
+                )
+            vg_literal_text_features = (
+                vg_literal_text_features.contiguous()
+            )
+
+        self.register_buffer(
+            "vg_literal_text_features",
+            vg_literal_text_features,
             persistent=False,
         )
 
@@ -237,7 +328,11 @@ class LAIN(nn.Module):
         # pair; only the inexpensive pair-conditioned composition happens
         # inside the image loop.
         text_features = None
-        if self.args.use_prompt:
+        needs_predicate_text_encoder = not (
+            self.dataset == "vg"
+            and self.vg_text_mode == "literal_cache"
+        )
+        if self.args.use_prompt and needs_predicate_text_encoder:
             if not self.training:
                 if self.tp is None: # when evaluation, compute text embeds once.
                     prompts = self.clip_head.prompt_learner()
@@ -299,14 +394,25 @@ class LAIN(nn.Module):
                 continue
 
             if self.dataset == "vg":
-                # [SGG compositional text]
-                # Produce [num_pairs, num_predicates, text_dim] prototypes
-                # without running the CLIP text transformer per triplet.
-                pair_text_features = self.compose_vg_text_features(
-                    labels[x_keep],
-                    labels[y_keep],
-                    text_features,
-                )
+                if self.vg_text_mode == "literal_cache":
+                    # [VG frozen literal text]
+                    # Directly retrieve CLIP-encoded S-P-O sentences. This
+                    # bypasses prompt learning and the pair composer only for
+                    # the explicit literal-cache experiment.
+                    pair_text_features = (
+                        self.lookup_vg_literal_text_features(
+                            labels[x_keep],
+                            labels[y_keep],
+                        )
+                    )
+                else:
+                    # [SGG compositional text]
+                    # Preserve the existing trainable prompt + MLP path.
+                    pair_text_features = self.compose_vg_text_features(
+                        labels[x_keep],
+                        labels[y_keep],
+                        text_features,
+                    )
 
             if self.args.use_hotoken:
                 # mask for each HO tokens + CLS
@@ -360,6 +466,56 @@ class LAIN(nn.Module):
             all_logits.append(logits)
 
         return all_logits, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated
+
+    def lookup_vg_literal_text_features(
+        self,
+        subject_labels: Tensor,
+        object_labels: Tensor,
+    ) -> Tensor:
+        """Look up frozen literal S-P-O CLIP prototypes for VG pairs."""
+        # [VG frozen literal text]
+        # Cache order is [subject, predicate, object, embedding]. Advanced
+        # indexing returns [num_pairs, 50, 512], matching the existing
+        # compositional text contract consumed by the einsum scorer.
+        if self.dataset != "vg" or self.vg_text_mode != "literal_cache":
+            raise RuntimeError(
+                "VG literal lookup called outside literal-cache mode"
+            )
+        if len(subject_labels) != len(object_labels):
+            raise ValueError(
+                "VG subject/object pair counts do not match"
+            )
+        if self.vg_literal_text_features.numel() == 0:
+            raise RuntimeError("VG literal text cache is not loaded")
+
+        subject_labels = subject_labels.long()
+        object_labels = object_labels.long()
+        num_objects = self.vg_literal_text_features.shape[0]
+        if len(subject_labels) > 0:
+            minimum_label = min(
+                subject_labels.min().item(),
+                object_labels.min().item(),
+            )
+            maximum_label = max(
+                subject_labels.max().item(),
+                object_labels.max().item(),
+            )
+            if minimum_label < 0 or maximum_label >= num_objects:
+                raise ValueError(
+                    "VG literal lookup label is outside the cache: "
+                    f"min={minimum_label}, max={maximum_label}, "
+                    f"num_objects={num_objects}"
+                )
+
+        pair_features = self.vg_literal_text_features[
+            subject_labels,
+            :,
+            object_labels,
+            :,
+        ]
+        # The visual cosine features are normalized in FP32. Promote only the
+        # selected pair slice; the full 1.1GB cache remains FP16 on GPU.
+        return pair_features.float()
 
     def compose_vg_text_features(
         self,
@@ -1181,10 +1337,25 @@ def build_detector(
                 "--egtr-detector-dir is required for VG"
             )
         # [SGG compositional text]
-        # Learned predicate contexts remain part of VG composition.
-        if not args.use_prompt:
+        # Learned predicate contexts remain required only for the original
+        # compositional path. Literal-cache mode deliberately bypasses them.
+        vg_text_mode = getattr(
+            args,
+            "vg_text_mode",
+            "compositional",
+        )
+        if vg_text_mode == "compositional" and not args.use_prompt:
             raise ValueError(
                 "--use_prompt is required for VG compositional text"
+            )
+
+        if vg_text_mode == "literal_cache" and not getattr(
+            args,
+            "vg_literal_cache",
+            "",
+        ):
+            raise ValueError(
+                "--vg-literal-cache is required for literal-cache text"
             )
 
         if (

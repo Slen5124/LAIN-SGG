@@ -45,6 +45,33 @@ def get_args():
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--box-score-thresh', default=0.2, type=float)
     parser.add_argument('--fg-iou-thresh', default=0.5, type=float)
+
+    # [VG frozen literal text]
+    # Keep the existing prompt + MLP composition as the default. The literal-cache
+    # path changes only VG text representation for a controlled ablation.
+    parser.add_argument(
+        '--vg-text-mode',
+        default='compositional',
+        choices=[
+            'compositional',
+            'literal_cache',
+        ],
+        help=(
+            'VG relation text representation. '
+            'compositional preserves the trainable prompt + MLP path; '
+            'literal_cache uses frozen CLIP S-P-O embeddings.'
+        ),
+    )
+    parser.add_argument(
+        '--vg-literal-cache',
+        default='',
+        type=str,
+        help=(
+            'Path to the external frozen VG literal S-P-O cache. '
+            'Required only with --vg-text-mode literal_cache.'
+        ),
+    )
+
     parser.add_argument('--min-instances', default=3, type=int)
     parser.add_argument('--max-instances', default=15, type=int)
 
