@@ -2,7 +2,9 @@ from typing import List, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from packaging import version
+from torch.utils.checkpoint import checkpoint
 
 from CLIP.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
@@ -103,6 +105,16 @@ class PromptLearner(nn.Module):
         self.register_buffer(
             'token_suffix',
             embedding[:, 1 + n_ctx:, :],
+        )
+
+        # [VG online literal text]
+        # Runtime S-P-O sentences require token embeddings whose weights stay
+        # frozen. A non-persistent buffer follows the module device without
+        # changing optimizer or checkpoint contracts.
+        self.register_buffer(
+            'token_embedding_weight',
+            clip_model.token_embedding.weight.detach(),
+            persistent=False,
         )
 
         self.n_cls = n_cls
@@ -215,6 +227,58 @@ class PromptLearner(nn.Module):
             self.name_lens,
         )
 
+    def forward_dynamic(
+        self,
+        classnames,
+        class_indices,
+    ):
+        """Assemble runtime S-P-O text with learned predicate contexts."""
+        # [VG online literal text]
+        # The literal suffix changes for every S-O pair, while class_indices
+        # selects the corresponding predicate context. With OvR CSC=False,
+        # all 50 predicates share the Base-trained context.
+        if len(classnames) != len(class_indices):
+            raise ValueError(
+                'Dynamic prompt count mismatch: '
+                f'classnames={len(classnames)}, '
+                f'class_indices={len(class_indices)}'
+            )
+        if len(classnames) == 0:
+            raise ValueError('Dynamic prompt input must not be empty')
+
+        classnames = [
+            name.replace('_', ' ')
+            for name in classnames
+        ]
+        name_lens = [
+            len(_tokenizer.encode(name))
+            for name in classnames
+        ]
+        prompt_strings = [
+            self.prompt_prefix + ' ' + name + '.'
+            for name in classnames
+        ]
+        tokenized_prompts = torch.cat([
+            tokenize(prompt)
+            for prompt in prompt_strings
+        ]).to(self.ctx.device)
+
+        embedding = F.embedding(
+            tokenized_prompts.long(),
+            self.token_embedding_weight,
+        ).type(self.dtype)
+        prefix = embedding[:, :1, :]
+        suffix = embedding[:, 1 + self.n_ctx:, :]
+        context = self._expand_context(class_indices)
+
+        prompts = self._assemble_prompts(
+            prefix,
+            context,
+            suffix,
+            name_lens,
+        )
+        return prompts, tokenized_prompts
+
 class CustomCLIP(nn.Module):
     def __init__(self, args, classnames, clip_model):
         super().__init__()
@@ -230,6 +294,54 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
+
+    def encode_dynamic_text(
+        self,
+        classnames,
+        class_indices,
+        chunk_size=256,
+        use_checkpoint=False,
+    ):
+        """Encode trainable literal S-P-O prompts in bounded chunks."""
+        # [VG online literal text]
+        # Chunking controls activation memory. Gradient checkpointing reruns
+        # the frozen text transformer during backward while retaining gradient
+        # flow into the learned prompt context.
+        if chunk_size <= 0:
+            raise ValueError(
+                f'chunk_size must be positive, got {chunk_size}'
+            )
+        if len(classnames) != len(class_indices):
+            raise ValueError(
+                'Dynamic text input count mismatch: '
+                f'classnames={len(classnames)}, '
+                f'class_indices={len(class_indices)}'
+            )
+
+        text_features = []
+        for start in range(0, len(classnames), chunk_size):
+            stop = min(start + chunk_size, len(classnames))
+            prompts, tokenized_prompts = (
+                self.prompt_learner.forward_dynamic(
+                    classnames[start:stop],
+                    class_indices[start:stop],
+                )
+            )
+            if self.training and use_checkpoint:
+                features = checkpoint(
+                    self.text_encoder,
+                    prompts,
+                    tokenized_prompts,
+                    use_reentrant=False,
+                )
+            else:
+                features = self.text_encoder(
+                    prompts,
+                    tokenized_prompts,
+                )
+            text_features.append(features)
+
+        return torch.cat(text_features, dim=0)
 
     def forward(self, image):
         image_features = self.image_encoder(

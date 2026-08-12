@@ -55,11 +55,14 @@ def get_args():
         choices=[
             'compositional',
             'literal_cache',
+            'online_literal',
         ],
         help=(
             'VG relation text representation. '
             'compositional preserves the trainable prompt + MLP path; '
             'literal_cache uses frozen CLIP S-P-O embeddings.'
+            'online_literal encodes trainable literal S-P-O prompts '
+            'during every forward pass.'
         ),
     )
     parser.add_argument(
@@ -69,6 +72,17 @@ def get_args():
         help=(
             'Path to the external frozen VG literal S-P-O cache. '
             'Required only with --vg-text-mode literal_cache.'
+        ),
+    )
+    # [VG online literal text]
+    # Number of literal S-P-O prompts processed by the CLIP text transformer
+    # at once. This bounds activation memory without changing candidate order.
+    parser.add_argument(
+        '--text-prompt-batch-size',
+        default=256,
+        type=int,
+        help=(
+            'CLIP text chunk size for --vg-text-mode online_literal.'
         ),
     )
 

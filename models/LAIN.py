@@ -70,6 +70,8 @@ class LAIN(nn.Module):
         min_instances: int = 3, max_instances: int = 15,
         object_class_to_target_class: List[list] = None,
         object_n_verb_to_interaction: List[list] = None,
+        object_class_names: Optional[List[str]] = None,
+        predicate_class_names: Optional[List[str]] = None,
 
     ) -> None:
         super().__init__()
@@ -98,6 +100,8 @@ class LAIN(nn.Module):
         self.min_instances = min_instances
         self.max_instances = max_instances
         self.object_class_to_target_class = object_class_to_target_class
+        self.object_class_names = object_class_names
+        self.predicate_class_names = predicate_class_names
 
         self.num_classes = num_classes
 
@@ -128,6 +132,7 @@ class LAIN(nn.Module):
         if self.vg_text_mode not in {
             "compositional",
             "literal_cache",
+            "online_literal",
         }:
             raise ValueError(
                 "Unsupported VG text mode: "
@@ -330,7 +335,7 @@ class LAIN(nn.Module):
         text_features = None
         needs_predicate_text_encoder = not (
             self.dataset == "vg"
-            and self.vg_text_mode == "literal_cache"
+            and self.vg_text_mode != "compositional"
         )
         if self.args.use_prompt and needs_predicate_text_encoder:
             if not self.training:
@@ -394,7 +399,37 @@ class LAIN(nn.Module):
                 continue
 
             if self.dataset == "vg":
-                if self.vg_text_mode == "literal_cache":
+                if self.vg_text_mode == "online_literal":
+                    # [VG online literal text]
+                    # Encode each pair x predicate S-P-O sentence with the
+                    # shared trainable prompt. Chunking and checkpointing bound
+                    # memory but retain gradients into the prompt context.
+                    triplet_prompts, predicate_indices = (
+                        self.build_vg_triplet_prompts(
+                            labels[x_keep],
+                            labels[y_keep],
+                        )
+                    )
+                    pair_text_features = (
+                        self.clip_head.encode_dynamic_text(
+                            classnames=triplet_prompts,
+                            class_indices=predicate_indices,
+                            chunk_size=(
+                                self.args.text_prompt_batch_size
+                            ),
+                            use_checkpoint=self.training,
+                        )
+                    )
+                    pair_text_features = F.normalize(
+                        pair_text_features.float(),
+                        dim=-1,
+                        eps=1e-6,
+                    ).view(
+                        len(x_keep),
+                        self.num_classes,
+                        -1,
+                    )
+                elif self.vg_text_mode == "literal_cache":
                     # [VG frozen literal text]
                     # Directly retrieve CLIP-encoded S-P-O sentences. This
                     # bypasses prompt learning and the pair composer only for
@@ -466,6 +501,69 @@ class LAIN(nn.Module):
             all_logits.append(logits)
 
         return all_logits, prior_collated, boxes_h_collated, boxes_o_collated, object_class_collated
+
+    def build_vg_triplet_prompts(
+        self,
+        subject_labels: Tensor,
+        object_labels: Tensor,
+    ):
+        """Build pair-major literal S-P-O strings for online encoding."""
+        # [VG online literal text]
+        # Pair-major ordering lets the flat CLIP output reshape directly to
+        # [num_pairs, num_predicates, text_dim].
+        if self.object_class_names is None:
+            raise RuntimeError("VG object class names are not initialized")
+        if self.predicate_class_names is None:
+            raise RuntimeError(
+                "VG predicate class names are not initialized"
+            )
+        if len(subject_labels) != len(object_labels):
+            raise ValueError(
+                "VG subject/object pair counts do not match"
+            )
+        if len(self.predicate_class_names) != self.num_classes:
+            raise ValueError(
+                "VG predicate vocabulary count mismatch"
+            )
+
+        subject_ids = subject_labels.detach().cpu().tolist()
+        object_ids = object_labels.detach().cpu().tolist()
+        num_objects = len(self.object_class_names)
+        triplet_prompts = []
+        predicate_indices = []
+
+        for subject_id, object_id in zip(subject_ids, object_ids):
+            if not (
+                0 <= subject_id < num_objects
+                and 0 <= object_id < num_objects
+            ):
+                raise ValueError(
+                    "VG pair label is outside the object vocabulary: "
+                    f"subject={subject_id}, object={object_id}, "
+                    f"num_objects={num_objects}"
+                )
+
+            subject_name = self.object_class_names[subject_id]
+            object_name = self.object_class_names[object_id]
+            for predicate_index, predicate_name in enumerate(
+                self.predicate_class_names
+            ):
+                triplet_prompts.append(
+                    "a photo of "
+                    f"{subject_name} "
+                    f"{predicate_name} "
+                    f"{object_name}"
+                )
+                predicate_indices.append(predicate_index)
+
+        return (
+            triplet_prompts,
+            torch.tensor(
+                predicate_indices,
+                dtype=torch.long,
+                device=subject_labels.device,
+            ),
+        )
 
     def lookup_vg_literal_text_features(
         self,
@@ -1344,9 +1442,20 @@ def build_detector(
             "vg_text_mode",
             "compositional",
         )
-        if vg_text_mode == "compositional" and not args.use_prompt:
+        if vg_text_mode in {
+            "compositional",
+            "online_literal",
+        } and not args.use_prompt:
             raise ValueError(
-                "--use_prompt is required for VG compositional text"
+                "--use_prompt is required for trainable VG text"
+            )
+
+        if (
+            vg_text_mode == "online_literal"
+            and args.text_prompt_batch_size <= 0
+        ):
+            raise ValueError(
+                "--text-prompt-batch-size must be positive"
             )
 
         if vg_text_mode == "literal_cache" and not getattr(
@@ -1468,6 +1577,7 @@ def build_detector(
 
     model = CustomCLIP(args, classnames=classnames, clip_model=clip_model)
 
+    vg_object_names = None
     if args.dataset == "vg":
         vg_object_names = get_vg_object_names(
             args.data_root
@@ -1508,6 +1618,12 @@ def build_detector(
         max_instances=args.max_instances,
         object_class_to_target_class=class_corr,
         object_n_verb_to_interaction=object_n_verb_to_interaction,
+        object_class_names=vg_object_names,
+        predicate_class_names=(
+            classnames
+            if args.dataset == "vg"
+            else None
+        ),
     )
 
     return detector
