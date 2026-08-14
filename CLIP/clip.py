@@ -252,9 +252,30 @@ class ResidualAttentionBlock(nn.Module):
         self.adapter = adapter
         self.args = args
 
-    def attention(self, x: torch.Tensor,mask):
-        # self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        ret, mask = self.attn(x, x, x, need_weights=True, attn_mask=mask if torch.is_tensor(mask) else None)
+    def attention(self, x: torch.Tensor, mask):
+        # [Restore the original CLIP text-attention contract]
+        # LAIN visual blocks may receive a runtime mask, while CLIP text
+        # blocks must fall back to their checkpoint-compatible causal mask.
+        # The previous implementation discarded self.attn_mask whenever no
+        # runtime mask was passed and collapsed the rebuilt text features.
+        attention_mask = (
+            mask
+            if torch.is_tensor(mask)
+            else self.attn_mask
+        )
+        if torch.is_tensor(attention_mask):
+            attention_mask = attention_mask.to(
+                dtype=x.dtype,
+                device=x.device,
+            )
+
+        ret, _ = self.attn(
+            x,
+            x,
+            x,
+            need_weights=True,
+            attn_mask=attention_mask,
+        )
         return ret
 
     def forward(self, x: torch.Tensor,mask=None, prior=None, la_masks=None):
@@ -582,3 +603,4 @@ def build_model(state_dict: dict, use_adapter=True, adapter_pos='all',args=None)
     print('[INFO] missing_keys:', [ k for k in missing_keys if 'adaptermlp' not in k])
     print('[INFO] unexpected_keys:', unexpected_keys)
     return model
+
