@@ -8,6 +8,7 @@ The Australian National University
 Australian Centre for Robotic Vision
 """
 import os
+import copy
 import torch
 import random
 import warnings
@@ -73,7 +74,29 @@ def main(rank, args):
         )
 
     train_debug_size = min(args.debug_samples, len(trainset))
-    test_debug_size = min(args.debug_samples, len(testset))
+
+    if args.overfit_debug:
+        # [Tiny-set memorization test]
+        # Train and evaluate the exact same image IDs and annotations with
+        # deterministic test transforms. Disabling random crop/flip isolates
+        # optimization and target-association bugs from augmentation noise.
+        # A shallow wrapper copy is sufficient: VG annotations are read-only
+        # and each __getitem__ constructs a fresh target.
+        overfit_evalset = copy.copy(trainset)
+        eval_transforms = testset.transforms
+        eval_clip_transforms = testset.clip_transforms
+        trainset.transforms = eval_transforms
+        trainset.clip_transforms = eval_clip_transforms
+        overfit_evalset.transforms = eval_transforms
+        overfit_evalset.clip_transforms = eval_clip_transforms
+        testset = overfit_evalset
+        test_debug_size = train_debug_size
+        print(
+            '[DEBUG] overfit mode: evaluating the same '
+            f'{train_debug_size} train samples with deterministic transforms'
+        )
+    else:
+        test_debug_size = min(args.debug_samples, len(testset))
 
     class _DebugTrainSubset(type(trainset)):
         def __len__(self):
@@ -87,7 +110,8 @@ def main(rank, args):
     testset.__class__ = _DebugTestSubset
     print(
         '[DEBUG] dataset lengths: '
-        f'train={len(trainset)}, test={len(testset)}'
+        f'train={len(trainset)}, test={len(testset)}, '
+        f'overfit={args.overfit_debug}'
     )
 
     # if args.dataset == 'vcoco':
@@ -178,7 +202,10 @@ def main(rank, args):
                 print(
                     'VG SGDet: '
                     + ', '.join(
-                        f'{key}={value * 100:.2f}'
+                        # [VG metric display]
+                        # Preserve evaluator keys for compatibility and rename
+                        # zero-shot Recall only in the user-facing log.
+                        f'{("nR@" + key.split("@", 1)[1]) if key.startswith("zR@") else key}={value * 100:.2f}'
                         for key, value in metrics.items()
                     )
                 )
@@ -228,11 +255,26 @@ def main(rank, args):
     for p in lain.detector.parameters():
         p.requires_grad = False
 
+    # [VG fixed-text optimizer contract]
+    # ``frozen_predicate`` and ``literal_cache`` bypass PromptLearner during
+    # every forward pass. Keep its parameters frozen and out of AdamW in those
+    # modes. Trainable predicate and online-literal modes still require the
+    # original LAIN prompt-learning path.
+    train_text_prompt = not (
+        args.dataset == 'vg'
+        and getattr(args, 'vg_text_mode', 'predicate') in {
+            'frozen_predicate',
+            'literal_cache',
+        }
+    )
+
     for n, p in lain.clip_head.named_parameters():
         if n.startswith('visual.positional_embedding') or n.startswith('visual.ln_post') or n.startswith('visual.proj'): 
             p.requires_grad = True
-        elif 'adaptermlp' in n or "prompt_learner" in n:
+        elif 'adaptermlp' in n:
             p.requires_grad = True
+        elif 'prompt_learner' in n:
+            p.requires_grad = train_text_prompt
         elif 'visual_prompt' in n:
             p.requires_grad = True
         else: p.requires_grad = False

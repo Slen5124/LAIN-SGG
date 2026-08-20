@@ -45,24 +45,19 @@ def get_args():
     parser.add_argument('--cache', action='store_true')
     parser.add_argument('--box-score-thresh', default=0.2, type=float)
     parser.add_argument('--fg-iou-thresh', default=0.5, type=float)
-
-    # [VG frozen literal text]
-    # Keep the existing prompt + MLP composition as the default. The literal-cache
-    # path changes only VG text representation for a controlled ablation.
     parser.add_argument(
         '--vg-text-mode',
-        default='compositional',
+        default='predicate',
         choices=[
-            'compositional',
+            'predicate',
+            'frozen_predicate',
             'literal_cache',
             'online_literal',
         ],
         help=(
-            'VG relation text representation. '
-            'compositional preserves the trainable prompt + MLP path; '
-            'literal_cache uses frozen CLIP S-P-O embeddings.'
-            'online_literal encodes trainable literal S-P-O prompts '
-            'during every forward pass.'
+            'VG text classifier mode. frozen_predicate encodes one fixed '
+            'shared CLIP prototype per predicate and preserves original '
+            'LAIN scoring without prompt learning or post-CLIP modules.'
         ),
     )
     parser.add_argument(
@@ -70,22 +65,29 @@ def get_args():
         default='',
         type=str,
         help=(
-            'Path to the external frozen VG literal S-P-O cache. '
-            'Required only with --vg-text-mode literal_cache.'
+            'External frozen literal S-P-O cache. Required only when '
+            '--vg-text-mode literal_cache.'
         ),
     )
-    # [VG online literal text]
-    # Number of literal S-P-O prompts processed by the CLIP text transformer
-    # at once. This bounds activation memory without changing candidate order.
     parser.add_argument(
         '--text-prompt-batch-size',
         default=256,
         type=int,
         help=(
-            'CLIP text chunk size for --vg-text-mode online_literal.'
+            'CLIP text chunk size used only by online_literal mode.'
         ),
     )
-
+    parser.add_argument(
+        '--vg-match-mode',
+        default='class_aware',
+        choices=['class_aware', 'iou_only'],
+        help=(
+            'Training-only VG relation matching rule. class_aware requires '
+            'subject/object IoU and both object classes to match; iou_only '
+            'uses the two IoU constraints without detector-class agreement. '
+            'VG SGDet evaluation remains class-aware.'
+        ),
+    )
     parser.add_argument('--min-instances', default=3, type=int)
     parser.add_argument('--max-instances', default=15, type=int)
 
@@ -205,15 +207,34 @@ def get_args():
             'unseen_object',
         ],
     )
-        # [VG open-vocabulary relation split]
-    # This is separate from the original HICO zero-shot configurations.
+
+    # [VG open-vocabulary relation split]
+    # This remains independent from the original HICO zero-shot settings.
     parser.add_argument(
-        "--vg-ovr",
-        action="store_true",
+        '--vg-ovr',
+        action='store_true',
         help=(
-            "Use the official OvSGTR VG150 relation split: "
-            "train on 35 base predicates and evaluate all 50 predicates "
-            "on split_GLIPunseen."
+            'Use the OvSGTR VG relation split: train on 35 base '
+            'predicates and evaluate base plus 15 novel predicates.'
+        ),
+    )
+    parser.add_argument(
+        '--vg-ovsgtr-protocol',
+        action='store_true',
+        help=(
+            'Match the official OvSGTR VG data protocol: reserve the '
+            'validation prefix, remove non-overlapping train relations, '
+            'merge duplicate entities, and sample one predicate per '
+            'directed pair. Requires --vg-ovr.'
+        ),
+    )
+    parser.add_argument(
+        '--vg-ovsgtr-num-val-images',
+        default=5000,
+        type=int,
+        help=(
+            'Number of valid VG train images reserved as the official '
+            'OvSGTR validation prefix.'
         ),
     )
 
@@ -292,6 +313,15 @@ def get_args():
         help=(
             'Number of train and test images exposed by debug_main.py. '
             'This changes only debug run scale, not the VG split.'
+        ),
+    )
+    parser.add_argument(
+        '--overfit-debug',
+        action='store_true',
+        help=(
+            'Tiny-set memorization test for debug_main.py. Train on the '
+            'debug train prefix and evaluate the exact same image IDs; both '
+            'paths use deterministic test transforms.'
         ),
     )
     parser.add_argument('--seed', default=66, type=int)

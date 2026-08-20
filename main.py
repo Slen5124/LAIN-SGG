@@ -146,7 +146,10 @@ def main(rank, args):
                 print(
                     'VG SGDet: '
                     + ', '.join(
-                        f'{key}={value * 100:.2f}'
+                        # [VG metric display]
+                        # Preserve evaluator keys for compatibility and rename
+                        # zero-shot Recall only in the user-facing log.
+                        f'{("nR@" + key.split("@", 1)[1]) if key.startswith("zR@") else key}={value * 100:.2f}'
                         for key, value in metrics.items()
                     )
                 )
@@ -196,11 +199,26 @@ def main(rank, args):
     for p in lain.detector.parameters():
         p.requires_grad = False
 
+    # [VG fixed-text optimizer contract]
+    # ``frozen_predicate`` and ``literal_cache`` bypass PromptLearner during
+    # every forward pass. Keep its parameters frozen and out of AdamW in those
+    # modes. Trainable predicate and online-literal modes still require the
+    # original LAIN prompt-learning path.
+    train_text_prompt = not (
+        args.dataset == 'vg'
+        and getattr(args, 'vg_text_mode', 'predicate') in {
+            'frozen_predicate',
+            'literal_cache',
+        }
+    )
+
     for n, p in lain.clip_head.named_parameters():
         if n.startswith('visual.positional_embedding') or n.startswith('visual.ln_post') or n.startswith('visual.proj'): 
             p.requires_grad = True
-        elif 'adaptermlp' in n or "prompt_learner" in n:
+        elif 'adaptermlp' in n:
             p.requires_grad = True
+        elif 'prompt_learner' in n:
+            p.requires_grad = train_text_prompt
         elif 'visual_prompt' in n:
             p.requires_grad = True
         else: p.requires_grad = False

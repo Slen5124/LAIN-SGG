@@ -27,6 +27,15 @@ OvR behavior when args.vg_ovr is enabled:
     - retain only base-predicate relations in training targets
     - exclude training images that contain no base relation
     - retain all base and novel relations for test evaluation
+
+Official OvSGTR protocol when args.vg_ovsgtr_protocol is enabled:
+    - reserve the first 5,000 valid training images as validation
+    - remove training relations whose subject/object boxes do not overlap
+    - merge same-class entities with IoU greater than 0.9
+    - sample one predicate for each duplicate directed pair during training
+
+The official protocol is opt-in so earlier LAIN-SGG experiments remain
+reproducible without changing their data contract.
 """
 
 import json
@@ -79,6 +88,22 @@ class VGDataset:
         self.vg_ovr = bool(
             getattr(args, "vg_ovr", False)
         )
+        self.vg_ovsgtr_protocol = bool(
+            getattr(args, "vg_ovsgtr_protocol", False)
+        )
+        self.vg_ovsgtr_num_val_images = int(
+            getattr(args, "vg_ovsgtr_num_val_images", 5000)
+        )
+
+        if self.vg_ovsgtr_protocol and not self.vg_ovr:
+            raise ValueError(
+                "--vg-ovsgtr-protocol requires --vg-ovr."
+            )
+
+        if self.vg_ovsgtr_num_val_images < 0:
+            raise ValueError(
+                "--vg-ovsgtr-num-val-images must be non-negative."
+            )
         self.num_object_cls = 150
         self.num_relation_cls = num_relations
 
@@ -208,17 +233,25 @@ class VGDataset:
         # split_GLIPunseen additionally uses -2 for excluded test images.
         split_code = 0 if split == "train" else 2
 
+        # Build the valid-image list before the OvSGTR validation-prefix
+        # slicing. This order matches the official loader.
+        candidate_indices = [
+            image_index
+            for image_index, split_value in enumerate(split_array)
+            if split_value == split_code
+            and self.img_to_first_box[image_index] >= 0
+            and self.img_to_first_rel[image_index] >= 0
+        ]
+
+        if self.vg_ovsgtr_protocol and split == "train":
+            candidate_indices = candidate_indices[
+                self.vg_ovsgtr_num_val_images:
+            ]
+
         self.image_index = []
         self.filenames = []
 
-        for image_index, split_value in enumerate(split_array):
-            if split_value != split_code:
-                continue
-
-            # Images without relationships cannot contribute to SGG training
-            # or relation recall evaluation.
-            if self.img_to_first_rel[image_index] < 0:
-                continue
+        for image_index in candidate_indices:
 
             # [Base-only OvR training images]
             # Official OvR training excludes images that contain no base
@@ -231,16 +264,39 @@ class VGDataset:
                     self.img_to_last_rel[image_index]
                 )
 
+                image_relationships = self.relationships[
+                    first_relation:last_relation + 1
+                ].astype(np.int64, copy=True)
                 image_predicates = self.predicates[
                     first_relation:last_relation + 1
                 ].reshape(-1).astype(np.int64) - 1
 
-                has_base_relation = np.isin(
+                keep_relation = np.isin(
                     image_predicates,
                     self.base_predicate_index_array,
-                ).any()
+                )
 
-                if not has_base_relation:
+                # Official OvSGTR additionally removes non-overlapping
+                # subject-object annotations from the training set.
+                if self.vg_ovsgtr_protocol:
+                    first_box = int(
+                        self.img_to_first_box[image_index]
+                    )
+                    last_box = int(
+                        self.img_to_last_box[image_index]
+                    )
+                    image_relationships[:, :2] -= first_box
+                    image_boxes = self._xcywh_1024_to_xyxy(
+                        self.boxes[first_box:last_box + 1],
+                        1024,
+                        1024,
+                    )
+                    keep_relation &= self._relationship_overlap_mask(
+                        image_boxes,
+                        image_relationships,
+                    )
+
+                if not keep_relation.any():
                     continue
 
             self.image_index.append(image_index)
@@ -254,6 +310,7 @@ class VGDataset:
             f"[VG] split={split}, "
             f"split_key={self.split_key}, "
             f"ovr={self.vg_ovr}, "
+            f"ovsgtr_protocol={self.vg_ovsgtr_protocol}, "
             f"{len(self.image_index)} images loaded "
             f"(objects={self.num_object_cls}, "
             f"relations={self.num_relation_cls})"
@@ -303,6 +360,144 @@ class VGDataset:
 
         return boxes_xyxy
 
+    @staticmethod
+    def _box_iou_matrix(boxes):
+        """Return pairwise IoU using the same continuous-box convention."""
+
+        boxes = np.asarray(boxes, dtype=np.float32)
+        top_left = np.maximum(
+            boxes[:, None, :2],
+            boxes[None, :, :2],
+        )
+        bottom_right = np.minimum(
+            boxes[:, None, 2:],
+            boxes[None, :, 2:],
+        )
+        intersection_size = np.clip(
+            bottom_right - top_left,
+            0,
+            None,
+        )
+        intersection = (
+            intersection_size[..., 0]
+            * intersection_size[..., 1]
+        )
+        box_size = np.clip(
+            boxes[:, 2:] - boxes[:, :2],
+            0,
+            None,
+        )
+        area = box_size[:, 0] * box_size[:, 1]
+        union = area[:, None] + area[None, :] - intersection
+        return np.divide(
+            intersection,
+            union,
+            out=np.zeros_like(intersection),
+            where=union > 0,
+        )
+
+    @classmethod
+    def _relationship_overlap_mask(cls, boxes, relationships):
+        """Select directed relations whose endpoint boxes overlap."""
+
+        if len(relationships) == 0:
+            return np.zeros((0,), dtype=bool)
+
+        num_boxes = len(boxes)
+        valid = (
+            (relationships[:, 0] >= 0)
+            & (relationships[:, 0] < num_boxes)
+            & (relationships[:, 1] >= 0)
+            & (relationships[:, 1] < num_boxes)
+        )
+        result = np.zeros(len(relationships), dtype=bool)
+        if valid.any():
+            iou = cls._box_iou_matrix(boxes)
+            relation_ids = np.nonzero(valid)[0]
+            result[relation_ids] = iou[
+                relationships[relation_ids, 0],
+                relationships[relation_ids, 1],
+            ] > 0
+        return result
+
+    @classmethod
+    def _merge_duplicate_entities(
+        cls,
+        boxes,
+        labels,
+        relationships,
+    ):
+        """Match official OvSGTR same-class IoU>0.9 entity merging."""
+
+        if len(boxes) == 0:
+            return boxes, labels, relationships
+
+        # ``boxes`` is retained in VG's stored [xc, yc, w, h] form so it
+        # can later be converted using the real image dimensions.  IoU,
+        # however, must be computed from [x1, y1, x2, y2] coordinates.
+        boxes_xyxy = cls._xcywh_1024_to_xyxy(
+            boxes,
+            1024,
+            1024,
+        )
+        entity_match = cls._box_iou_matrix(boxes_xyxy) > 0.9
+        entity_match &= labels[:, None] == labels[None, :]
+
+        keep_entity_ids = []
+        old_to_new = {}
+
+        # This intentionally mirrors OvSGTR's greedy row-order merge.
+        for entity_id in range(len(boxes)):
+            matched_ids = np.nonzero(entity_match[entity_id])[0]
+            if len(matched_ids) == 0:
+                continue
+
+            new_id = len(keep_entity_ids)
+            keep_entity_ids.append(entity_id)
+            for matched_id in matched_ids:
+                old_to_new[int(matched_id)] = new_id
+            entity_match[:, matched_ids] = False
+
+        remapped_relationships = relationships.copy()
+        for relation in remapped_relationships:
+            relation[0] = old_to_new[int(relation[0])]
+            relation[1] = old_to_new[int(relation[1])]
+
+        keep_entity_ids = np.asarray(
+            keep_entity_ids,
+            dtype=np.int64,
+        )
+        return (
+            boxes[keep_entity_ids],
+            labels[keep_entity_ids],
+            remapped_relationships,
+        )
+
+    @staticmethod
+    def _sample_one_predicate_per_pair(
+        relationships,
+        predicates,
+    ):
+        """Apply official train-time duplicate-pair predicate sampling."""
+
+        pair_to_predicates = {}
+        for relation, predicate in zip(relationships, predicates):
+            pair = (int(relation[0]), int(relation[1]))
+            pair_to_predicates.setdefault(pair, []).append(int(predicate))
+
+        sampled_relations = []
+        sampled_predicates = []
+        for pair, pair_predicates in pair_to_predicates.items():
+            sampled_relations.append(pair)
+            sampled_predicates.append(
+                np.random.choice(pair_predicates)
+            )
+
+        return (
+            np.asarray(sampled_relations, dtype=np.int64).reshape(-1, 2),
+            np.asarray(sampled_predicates, dtype=np.int64),
+        )
+
     def __getitem__(self, index):
         image_index = self.image_index[index]
         filename = self.filenames[index]
@@ -326,18 +521,10 @@ class VGDataset:
 
         boxes_local = self.boxes[
             first_box:last_box + 1
-        ]
+        ].copy()
         labels_local = self.labels[
             first_box:last_box + 1
-        ].squeeze(1)
-
-        num_objects = len(boxes_local)
-
-        boxes_xyxy = self._xcywh_1024_to_xyxy(
-            boxes_local,
-            image_width,
-            image_height,
-        )
+        ].squeeze(1).copy()
 
         first_relation = int(
             self.img_to_first_rel[image_index]
@@ -348,10 +535,11 @@ class VGDataset:
 
         relationships = self.relationships[
             first_relation:last_relation + 1
-        ]
+        ].astype(np.int64, copy=True)
+        relationships[:, :2] -= first_box
         predicates = self.predicates[
             first_relation:last_relation + 1
-        ].squeeze(1)
+        ].squeeze(1).astype(np.int64, copy=True)
 
         # [Base-only OvR train annotations]
         # Novel relations remain available in the test target, but are not
@@ -374,6 +562,73 @@ class VGDataset:
                     "dataset initialization filtering."
                 )
 
+        if self.vg_ovsgtr_protocol:
+            # The official code caps GT entities at 100 before merging.
+            # The audited VG split currently never exceeds this limit, but
+            # retaining it protects the exact contract for other copies.
+            if len(boxes_local) > 100:
+                selected = np.random.choice(
+                    len(boxes_local),
+                    100,
+                    replace=False,
+                )
+                old_to_new = {
+                    int(old_id): new_id
+                    for new_id, old_id in enumerate(selected)
+                }
+                keep_relation = np.asarray(
+                    [
+                        int(relation[0]) in old_to_new
+                        and int(relation[1]) in old_to_new
+                        for relation in relationships
+                    ],
+                    dtype=bool,
+                )
+                relationships = relationships[keep_relation]
+                predicates = predicates[keep_relation]
+                for relation in relationships:
+                    relation[0] = old_to_new[int(relation[0])]
+                    relation[1] = old_to_new[int(relation[1])]
+                boxes_local = boxes_local[selected]
+                labels_local = labels_local[selected]
+
+            boxes_for_protocol = self._xcywh_1024_to_xyxy(
+                boxes_local,
+                1024,
+                1024,
+            )
+
+            if self.split == "train":
+                keep_overlap = self._relationship_overlap_mask(
+                    boxes_for_protocol,
+                    relationships,
+                )
+                relationships = relationships[keep_overlap]
+                predicates = predicates[keep_overlap]
+
+            boxes_local, labels_local, relationships = (
+                self._merge_duplicate_entities(
+                    boxes_local,
+                    labels_local,
+                    relationships,
+                )
+            )
+
+            if self.split == "train":
+                relationships, predicates = (
+                    self._sample_one_predicate_per_pair(
+                        relationships,
+                        predicates,
+                    )
+                )
+
+        num_objects = len(boxes_local)
+        boxes_xyxy = self._xcywh_1024_to_xyxy(
+            boxes_local,
+            image_width,
+            image_height,
+        )
+
         subject_boxes = []
         object_boxes = []
         predicate_classes = []
@@ -384,10 +639,8 @@ class VGDataset:
             relationships,
             predicates,
         ):
-            # VG-SGG.h5 stores global indices into the complete box array.
-            # Convert them to image-local indices before indexing boxes_local.
-            subject_index = int(relation[0]) - first_box
-            object_index = int(relation[1]) - first_box
+            subject_index = int(relation[0])
+            object_index = int(relation[1])
 
             valid_subject = (
                 0 <= subject_index < num_objects

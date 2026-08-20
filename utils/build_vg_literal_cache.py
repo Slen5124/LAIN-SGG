@@ -1,27 +1,25 @@
-"""Build a frozen CLIP cache for all VG150 literal S-P-O triplets.
+"""Build a frozen VG150 literal S-P-O cache with the active CLIP code.
 
-The cache contains 150 subject classes x 50 predicates x 150 object classes.
-Each literal prompt is encoded exactly once by the frozen CLIP text encoder,
-L2-normalized, converted to FP16, and stored under /mnt/sdb by the caller.
-
-This is preprocessing only. It does not alter LAIN, a training checkpoint, or
-the VG annotations.
+The flattened generation order is subject-major, then predicate, then object.
+The saved tensor therefore has the explicit layout
+``[subject, predicate, object, embedding]``.
 """
 
 import argparse
 import hashlib
 import json
+import os
 import sys
-import time
 from pathlib import Path
-
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-if str(REPOSITORY_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from CLIP.clip import build_model
 from CLIP.customCLIP import tokenize
@@ -29,204 +27,188 @@ from utils.vg_list import VG150_PREDICATES, get_vg_object_names
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-root", required=True)
+    parser = argparse.ArgumentParser(
+        description="Build the frozen VG150 literal S-P-O CLIP cache",
+    )
     parser.add_argument("--clip-checkpoint", required=True)
+    parser.add_argument("--data-root", default="vg")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument(
         "--template",
         default="a photo of {subject} {predicate} {object}",
-        help=(
-            "Literal prompt template. Required fields are {subject}, "
-            "{predicate}, and {object}."
-        ),
     )
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
-def validate_template(template):
-    for field in ("{subject}", "{predicate}", "{object}"):
-        if field not in template:
-            raise ValueError(
-                f"Literal template must contain {field}: {template}"
-            )
-
-
-def vocabulary_hash(object_names, predicate_names, template):
-    payload = json.dumps(
+def vocabulary_hash(objects, predicates, template):
+    canonical = json.dumps(
         {
-            "objects": list(object_names),
-            "predicates": list(predicate_names),
+            "objects": objects,
+            "predicates": predicates,
             "template": template,
         },
         ensure_ascii=False,
+        separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def flat_triplet_indices(flat_indices, num_predicates, num_objects):
-    per_subject = num_predicates * num_objects
-    subject_indices = torch.div(
-        flat_indices,
-        per_subject,
-        rounding_mode="floor",
-    )
-    remainder = flat_indices.remainder(per_subject)
-    predicate_indices = torch.div(
-        remainder,
-        num_objects,
-        rounding_mode="floor",
-    )
-    object_indices = remainder.remainder(num_objects)
-    return subject_indices, predicate_indices, object_indices
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def main():
-    args = parse_args()
-    validate_template(args.template)
-
-    if args.batch_size <= 0:
+    cli = parse_args()
+    if cli.batch_size <= 0:
         raise ValueError("--batch-size must be positive")
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required to build the literal cache")
+    if cli.device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
 
-    object_names = list(get_vg_object_names(args.data_root))
-    predicate_names = list(VG150_PREDICATES)
-    num_objects = len(object_names)
-    num_predicates = len(predicate_names)
+    checkpoint_path = Path(cli.clip_checkpoint).resolve()
+    output_path = Path(cli.output).resolve()
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    if output_path.exists() and not cli.overwrite:
+        raise FileExistsError(
+            f"Output already exists: {output_path}. "
+            "Use a new path or pass --overwrite."
+        )
 
+    objects = list(get_vg_object_names(cli.data_root))
+    predicates = list(VG150_PREDICATES)
+    num_objects = len(objects)
+    num_predicates = len(predicates)
     if num_objects != 150 or num_predicates != 50:
         raise ValueError(
             "Unexpected VG vocabulary sizes: "
             f"objects={num_objects}, predicates={num_predicates}"
         )
 
-    checkpoint_path = Path(args.clip_checkpoint).resolve()
-    output_path = Path(args.output).resolve()
-    if output_path.exists():
-        raise FileExistsError(
-            "Refusing to overwrite an existing cache: "
-            f"{output_path}"
-        )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
     print("Visible GPU count:", torch.cuda.device_count())
-    print("Visible GPU:", torch.cuda.get_device_name(0))
+    if cli.device.startswith("cuda"):
+        print("Visible GPU:", torch.cuda.get_device_name(0))
     print("Objects:", num_objects)
     print("Predicates:", num_predicates)
     print("Triplets:", num_objects * num_predicates * num_objects)
-    print("Template:", args.template)
+    print("Template:", cli.template)
 
-    clip_state = torch.load(
-        checkpoint_path,
+    checkpoint_model = torch.jit.load(
+        str(checkpoint_path),
         map_location="cpu",
-        weights_only=False,
-    ).state_dict()
-    model = build_model(
-        state_dict=clip_state,
+    )
+    state_dict = checkpoint_model.state_dict()
+    del checkpoint_model
+    clip_model = build_model(
+        state_dict,
         use_adapter=False,
         adapter_pos="all",
         args=None,
-    ).cuda().eval()
+    ).to(cli.device).eval()
 
-    total_triplets = num_objects * num_predicates * num_objects
-    output_dim = int(model.text_projection.shape[1])
-    # [Frozen literal cache]
-    # Allocate on CPU so only the active prompt batch occupies GPU memory.
-    # FP16 requires about 1.07 GiB for VG150 with 512-dimensional CLIP text.
+    embedding_dim = int(clip_model.text_projection.shape[1])
+    expected_embedding_dim = 512
+    if embedding_dim != expected_embedding_dim:
+        raise ValueError(
+            "Unexpected CLIP text embedding dimension: "
+            f"expected={expected_embedding_dim}, actual={embedding_dim}"
+        )
+
+    total = num_objects * num_predicates * num_objects
     flat_cache = torch.empty(
-        total_triplets,
-        output_dim,
+        (total, embedding_dim),
         dtype=torch.float16,
         device="cpu",
     )
 
-    started = time.time()
     with torch.inference_mode():
-        for start in tqdm(
-            range(0, total_triplets, args.batch_size),
+        progress = tqdm(
+            range(0, total, cli.batch_size),
             desc="Encoding literal S-P-O prompts",
-        ):
-            end = min(start + args.batch_size, total_triplets)
-            flat_indices = torch.arange(start, end, dtype=torch.long)
-            subject_indices, predicate_indices, object_indices = (
-                flat_triplet_indices(
-                    flat_indices,
-                    num_predicates,
-                    num_objects,
+        )
+        for start in progress:
+            end = min(start + cli.batch_size, total)
+            prompts = []
+            for flat_index in range(start, end):
+                subject_index = flat_index // (
+                    num_predicates * num_objects
                 )
-            )
+                remainder = flat_index % (
+                    num_predicates * num_objects
+                )
+                predicate_index = remainder // num_objects
+                object_index = remainder % num_objects
+                prompts.append(
+                    cli.template.format(
+                        subject=objects[subject_index],
+                        predicate=predicates[predicate_index],
+                        object=objects[object_index],
+                    )
+                )
 
-            prompts = [
-                args.template.format(
-                    subject=object_names[int(subject_index)],
-                    predicate=predicate_names[int(predicate_index)],
-                    object=object_names[int(object_index)],
-                )
-                for subject_index, predicate_index, object_index in zip(
-                    subject_indices,
-                    predicate_indices,
-                    object_indices,
-                )
-            ]
-            tokens = tokenize(prompts).cuda(non_blocking=False)
-            embeddings = model.encode_text(tokens)
-            embeddings = F.normalize(
-                embeddings.float(),
-                dim=-1,
-                eps=1e-6,
+            tokens = torch.cat(
+                [tokenize(prompt) for prompt in prompts],
+                dim=0,
+            ).to(cli.device)
+            text_features = clip_model.encode_text(tokens).float()
+            text_features = F.normalize(text_features, dim=-1)
+            flat_cache[start:end].copy_(
+                text_features.to(dtype=torch.float16, device="cpu")
             )
-            flat_cache[start:end].copy_(embeddings.to("cpu", torch.float16))
 
     cache = flat_cache.view(
         num_objects,
         num_predicates,
         num_objects,
-        output_dim,
+        embedding_dim,
     )
+    if not torch.isfinite(cache).all():
+        raise ValueError("Generated cache contains NaN or infinity")
+
+    norm_min = float("inf")
+    norm_max = float("-inf")
+    for start in range(0, num_objects, 10):
+        norms = cache[start:start + 10].float().norm(dim=-1)
+        norm_min = min(norm_min, float(norms.min()))
+        norm_max = max(norm_max, float(norms.max()))
+
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "shape_order": [
-            "subject_class",
-            "predicate_class",
-            "object_class",
+            "subject",
+            "predicate",
+            "object",
             "embedding",
         ],
-        "shape": list(cache.shape),
-        "dtype": "float16",
+        "objects": objects,
+        "predicates": predicates,
+        "template": cli.template,
         "normalized": True,
-        "template": args.template,
-        "objects": object_names,
-        "predicates": predicate_names,
-        "vocabulary_sha256": vocabulary_hash(
-            object_names,
-            predicate_names,
-            args.template,
-        ),
+        "dtype": "float16",
+        "embedding_dim": embedding_dim,
         "clip_checkpoint": str(checkpoint_path),
+        "causal_text_attention": True,
+        "vocabulary_sha256": vocabulary_hash(
+            objects,
+            predicates,
+            cli.template,
+        ),
+    }
+    payload = {
+        "text_features": cache,
+        "metadata": metadata,
     }
 
-    torch.save(
-        {
-            "text_features": cache,
-            "metadata": metadata,
-        },
-        output_path,
-    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if temporary_path.exists():
+        temporary_path.unlink()
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, output_path)
 
-    elapsed = time.time() - started
     print("Cache shape:", tuple(cache.shape))
     print("Cache dtype:", cache.dtype)
-    print(
-        "Norm range:",
-        float(cache.float().norm(dim=-1).min()),
-        float(cache.float().norm(dim=-1).max()),
-    )
-    print("Elapsed seconds:", round(elapsed, 1))
+    print("Norm range:", norm_min, norm_max)
+    print("Vocabulary hash:", metadata["vocabulary_sha256"])
     print("Saved:", output_path)
-    print("VG frozen literal S-P-O cache: OK")
+    print("VG causal-fixed literal S-P-O cache: OK")
 
 
 if __name__ == "__main__":

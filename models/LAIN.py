@@ -72,6 +72,7 @@ class LAIN(nn.Module):
         object_n_verb_to_interaction: List[list] = None,
         object_class_names: Optional[List[str]] = None,
         predicate_class_names: Optional[List[str]] = None,
+        frozen_predicate_embedding: Optional[Tensor] = None,
 
     ) -> None:
         super().__init__()
@@ -107,6 +108,30 @@ class LAIN(nn.Module):
 
         self.dataset = args.dataset
 
+        # [VG configurable training matching]
+        # Keep the original class-aware rule as the default. ``iou_only`` is
+        # an explicit training ablation that increases predicate supervision
+        # by accepting geometrically matched pairs even when the frozen
+        # detector predicts an incorrect endpoint class. Evaluation remains
+        # class-aware and is not changed by this option.
+        self.vg_match_mode = getattr(
+            args,
+            "vg_match_mode",
+            "class_aware",
+        )
+        if self.vg_match_mode not in {
+            "class_aware",
+            "iou_only",
+        }:
+            raise ValueError(
+                "Unsupported VG matching mode: "
+                f"{self.vg_match_mode}"
+            )
+        if self.dataset != "vg" and self.vg_match_mode != "class_aware":
+            raise ValueError(
+                "--vg-match-mode iou_only can only be used with VG"
+            )
+
         # [VG OvR supervision]
         # Preserve every existing dataset path by enabling predicate masking
         # only for the explicit --vg-ovr configuration.
@@ -114,15 +139,14 @@ class LAIN(nn.Module):
             getattr(args, "vg_ovr", False)
         )
 
-        # [VG frozen literal text]
-        # Keep the existing trainable prompt + MLP composition as the default.
-        # The literal-cache path is an explicit ablation that replaces only
-        # the text representation while preserving detector, pair generation,
-        # visual LAIN modules, matching, loss, and evaluation.
+        # [VG predicate-only text]
+        # Use the normalized CLIP predicate features directly as relation
+        # prototypes.  No trainable module is allowed after the text encoder.
+        # Literal-cache and online-literal remain explicit comparison paths.
         self.vg_text_mode = getattr(
             args,
             "vg_text_mode",
-            "compositional",
+            "predicate",
         )
         self.vg_literal_cache_path = getattr(
             args,
@@ -130,7 +154,8 @@ class LAIN(nn.Module):
             "",
         )
         if self.vg_text_mode not in {
-            "compositional",
+            "predicate",
+            "frozen_predicate",
             "literal_cache",
             "online_literal",
         }:
@@ -138,7 +163,7 @@ class LAIN(nn.Module):
                 "Unsupported VG text mode: "
                 f"{self.vg_text_mode}"
             )
-        if self.dataset != "vg" and self.vg_text_mode != "compositional":
+        if self.dataset != "vg" and self.vg_text_mode != "predicate":
             raise ValueError(
                 "Literal S-P-O text cache can only be used with VG"
             )
@@ -249,6 +274,46 @@ class LAIN(nn.Module):
             persistent=False,
         )
 
+        # [VG frozen shared predicate text]
+        # Preserve the original LAIN classifier contract: every visual pair
+        # shares one [num_predicates, embedding] text table.  Unlike the
+        # trainable-prompt path, these prototypes are encoded once from fixed
+        # object-relation-object sentences and never updated during training.
+        if frozen_predicate_embedding is None:
+            frozen_predicate_embedding = torch.empty(
+                0,
+                self.visual_output_dim,
+                dtype=torch.float32,
+            )
+        if self.dataset == "vg" and self.vg_text_mode == "frozen_predicate":
+            expected_shape = (
+                self.num_classes,
+                self.visual_output_dim,
+            )
+            if tuple(frozen_predicate_embedding.shape) != expected_shape:
+                raise ValueError(
+                    "VG frozen predicate feature shape mismatch: "
+                    f"expected={expected_shape}, "
+                    f"actual={tuple(frozen_predicate_embedding.shape)}"
+                )
+            if not torch.isfinite(frozen_predicate_embedding).all():
+                raise ValueError(
+                    "VG frozen predicate features contain non-finite values"
+                )
+            frozen_predicate_embedding = F.normalize(
+                frozen_predicate_embedding.float(),
+                dim=-1,
+                eps=1e-6,
+            ).contiguous()
+
+        # The table is recreated from the fixed template and CLIP checkpoint
+        # on every build/resume, so it is not duplicated in model checkpoints.
+        self.register_buffer(
+            "vg_frozen_predicate_features",
+            frozen_predicate_embedding,
+            persistent=False,
+        )
+
         self.hyper_lambda = args.hyper_lambda
 
         self.use_insadapter = args.use_insadapter
@@ -262,29 +327,6 @@ class LAIN(nn.Module):
 
 
         self.query_proj = MLP(512, 128, 768, 2)
-
-        if self.dataset == "vg":
-            # [SGG compositional text]
-            # Build a cheap ordered S-O condition from frozen VG object
-            # text embeddings. The condition modulates the 50 learned
-            # predicate features instead of re-encoding every literal
-            # S-P-O sentence with the CLIP text transformer.
-            self.triplet_pair_composer = MLP(
-                self.visual_output_dim * 4,
-                self.visual_output_dim,
-                self.visual_output_dim * 2,
-                2,
-            )
-
-            # Start close to the original predicate text features while
-            # retaining a small, direction-sensitive S-O contribution.
-            nn.init.normal_(
-                self.triplet_pair_composer.layers[-1].weight,
-                std=1e-3,
-            )
-            nn.init.zeros_(
-                self.triplet_pair_composer.layers[-1].bias
-            )
 
     def _reset_parameters(self):  ## xxx
         for p in self.context_aware.parameters():
@@ -327,15 +369,18 @@ class LAIN(nn.Module):
         # pairwise_tokens_collated = []
         all_logits = []
 
-        # Encode the active predicate vocabulary once per forward pass.
-        # [SGG compositional text]
-        # VG reuses these 50 predicate features for every directed S-O
-        # pair; only the inexpensive pair-conditioned composition happens
-        # inside the image loop.
+        # [VG predicate-only text]
+        # Encode the active predicate vocabulary once per forward pass and
+        # compare those normalized CLIP outputs directly with every directed
+        # pair.  There is no trainable post-text-encoder modulation.
         text_features = None
+        if self.dataset == "vg" and self.vg_text_mode == "frozen_predicate":
+            # [VG frozen shared predicate text]
+            # No PromptLearner or text-encoder forward is needed in training.
+            text_features = self.vg_frozen_predicate_features
         needs_predicate_text_encoder = not (
             self.dataset == "vg"
-            and self.vg_text_mode != "compositional"
+            and self.vg_text_mode != "predicate"
         )
         if self.args.use_prompt and needs_predicate_text_encoder:
             if not self.training:
@@ -441,13 +486,18 @@ class LAIN(nn.Module):
                         )
                     )
                 else:
-                    # [SGG compositional text]
-                    # Preserve the existing trainable prompt + MLP path.
-                    pair_text_features = self.compose_vg_text_features(
-                        labels[x_keep],
-                        labels[y_keep],
-                        text_features,
-                    )
+                    # [VG predicate-only text]
+                    # Subject/object conditioning remains in the directed HO
+                    # token and IA/LA visual path.  The text prototypes are the
+                    # normalized CLIP predicate outputs without an extra MLP.
+                    if self.vg_text_mode not in {
+                        "predicate",
+                        "frozen_predicate",
+                    }:
+                        raise RuntimeError(
+                            "Unsupported VG text scoring mode: "
+                            f"{self.vg_text_mode}"
+                        )
 
             if self.args.use_hotoken:
                 # mask for each HO tokens + CLS
@@ -479,16 +529,24 @@ class LAIN(nn.Module):
             global_feat = global_feat[:, :-1]
 
 
-            if self.dataset == "vg":
-                # [SGG compositional text]
-                # Compare each visual pair with its 50 pair-conditioned
-                # predicate prototypes.
+            if (
+                self.dataset == "vg"
+                and self.vg_text_mode in {
+                    "literal_cache",
+                    "online_literal",
+                }
+            ):
+                # Literal modes provide pair-conditioned S-P-O prototypes.
                 logits_text = torch.einsum(
                     "bpd,pcd->bpc",
                     global_feat,
                     pair_text_features,
                 )
             else:
+                # [VG predicate-only text]
+                # This is also the original LAIN classifier contract: every
+                # visual pair is compared directly with the shared text
+                # vocabulary returned by the CLIP text encoder.
                 logits_text = global_feat @ text_features.T
             logits = logits_text.squeeze(0) * self.logit_scale_text.exp()
 
@@ -574,7 +632,7 @@ class LAIN(nn.Module):
         # [VG frozen literal text]
         # Cache order is [subject, predicate, object, embedding]. Advanced
         # indexing returns [num_pairs, 50, 512], matching the existing
-        # compositional text contract consumed by the einsum scorer.
+        # pair-conditioned literal-text contract consumed by the einsum scorer.
         if self.dataset != "vg" or self.vg_text_mode != "literal_cache":
             raise RuntimeError(
                 "VG literal lookup called outside literal-cache mode"
@@ -614,103 +672,6 @@ class LAIN(nn.Module):
         # The visual cosine features are normalized in FP32. Promote only the
         # selected pair slice; the full 1.1GB cache remains FP16 on GPU.
         return pair_features.float()
-
-    def compose_vg_text_features(
-        self,
-        subject_labels: Tensor,
-        object_labels: Tensor,
-        predicate_features: Tensor,
-    ) -> Tensor:
-        """Compose ordered VG S-P-O text prototypes without literal text."""
-        # [SGG compositional text]
-        # Subject and object occupy different ordered positions. Their
-        # difference and elementwise product add directional and pairwise
-        # information before FiLM modulation of predicate text features.
-        if self.dataset != "vg":
-            raise RuntimeError(
-                "VG text composition was called for a non-VG dataset"
-            )
-        if len(subject_labels) != len(object_labels):
-            raise ValueError(
-                "VG subject/object pair counts do not match"
-            )
-        if predicate_features.ndim != 2:
-            raise ValueError(
-                "Predicate features must have shape "
-                "[num_predicates, text_dim]"
-            )
-        if predicate_features.shape[0] != self.num_classes:
-            raise ValueError(
-                "VG predicate feature count mismatch: "
-                f"features={predicate_features.shape[0]}, "
-                f"num_classes={self.num_classes}"
-            )
-
-        num_object_classes = self.object_embedding.shape[0]
-        if len(subject_labels) > 0:
-            minimum_label = min(
-                subject_labels.min().item(),
-                object_labels.min().item(),
-            )
-            maximum_label = max(
-                subject_labels.max().item(),
-                object_labels.max().item(),
-            )
-            if minimum_label < 0 or maximum_label >= num_object_classes:
-                raise ValueError(
-                    "VG pair label is outside the object vocabulary: "
-                    f"min={minimum_label}, max={maximum_label}, "
-                    f"num_objects={num_object_classes}"
-                )
-
-        # [AMP numerical stability]
-        # Pair composition is small relative to the visual/text backbones, so
-        # run its trainable normalizations and divisions in FP32.
-        with torch.autocast(
-            device_type=predicate_features.device.type,
-            enabled=False,
-        ):
-            predicate_features = predicate_features.float()
-            object_vocabulary_features = F.normalize(
-                self.object_embedding.float(),
-                dim=-1,
-                eps=1e-6,
-            )
-            subject_features = object_vocabulary_features[
-                subject_labels.long()
-            ]
-            object_features = object_vocabulary_features[
-                object_labels.long()
-            ]
-
-            ordered_pair_features = torch.cat(
-                [
-                    subject_features,
-                    object_features,
-                    subject_features - object_features,
-                    subject_features * object_features,
-                ],
-                dim=-1,
-            )
-            modulation = self.triplet_pair_composer(
-                ordered_pair_features
-            )
-            scale, shift = modulation.chunk(2, dim=-1)
-
-            # Bounded scaling prevents the newly initialized composer from
-            # overwhelming the pretrained CLIP predicate representation.
-            scale = torch.tanh(scale)
-            triplet_features = (
-                predicate_features.unsqueeze(0)
-                * (1.0 + scale.unsqueeze(1))
-                + shift.unsqueeze(1)
-            )
-
-            return F.normalize(
-                triplet_features,
-                dim=-1,
-                eps=1e-6,
-            )
 
     def generate_pair_indices(self, labels: Tensor):
         """Generate directed relation pairs for the active dataset."""
@@ -794,54 +755,70 @@ class LAIN(nn.Module):
         ) >= self.fg_iou_thresh
 
         if self.dataset == "vg":
-            # [SGG class-aware matching]
-            # VG permits every object class to be either the subject or
-            # object, so box overlap alone is not a valid triplet match.
-            required_fields = {
-                "subject",
-                "object",
-                "verb",
-            }
+            # [VG configurable training matching]
+            # Both modes require predicate targets. Class-aware matching also
+            # requires the two GT endpoint classes; IoU-only deliberately
+            # omits those class constraints to expose more positive pairs.
+            required_fields = {"verb"}
+            if self.vg_match_mode == "class_aware":
+                required_fields.update({"subject", "object"})
             missing_fields = required_fields.difference(targets)
 
             if missing_fields:
                 raise KeyError(
                     "VG target is missing fields required for "
-                    f"class-aware matching: {sorted(missing_fields)}"
+                    f"{self.vg_match_mode} matching: "
+                    f"{sorted(missing_fields)}"
                 )
 
-            gt_subject_labels = targets["subject"].long()
-            gt_object_labels = targets["object"].long()
             gt_predicates = targets["verb"].long()
             num_gt_relations = len(gt_bx_h)
 
-            if not (
-                len(gt_subject_labels)
-                == len(gt_object_labels)
-                == len(gt_predicates)
-                == num_gt_relations
-            ):
+            if len(gt_predicates) != num_gt_relations:
                 raise ValueError(
-                    "VG GT triplet fields must have equal lengths: "
+                    "VG GT predicate and box counts must match: "
                     f"boxes={num_gt_relations}, "
-                    f"subject={len(gt_subject_labels)}, "
-                    f"object={len(gt_object_labels)}, "
                     f"verb={len(gt_predicates)}"
                 )
 
-            subject_class_matches = (
-                subject_labels.long()[:, None]
-                == gt_subject_labels[None, :]
-            )
-            object_class_matches = (
-                object_labels.long()[:, None]
-                == gt_object_labels[None, :]
-            )
-            pair_matches = (
-                pair_matches
-                & subject_class_matches
-                & object_class_matches
-            )
+            if self.vg_match_mode == "class_aware":
+                # [Original VG rule]
+                # Require both endpoint classes in addition to the two IoUs.
+                gt_subject_labels = targets["subject"].long()
+                gt_object_labels = targets["object"].long()
+
+                if not (
+                    len(gt_subject_labels)
+                    == len(gt_object_labels)
+                    == num_gt_relations
+                ):
+                    raise ValueError(
+                        "VG GT endpoint fields must have equal lengths: "
+                        f"boxes={num_gt_relations}, "
+                        f"subject={len(gt_subject_labels)}, "
+                        f"object={len(gt_object_labels)}"
+                    )
+
+                subject_class_matches = (
+                    subject_labels.long()[:, None]
+                    == gt_subject_labels[None, :]
+                )
+                object_class_matches = (
+                    object_labels.long()[:, None]
+                    == gt_object_labels[None, :]
+                )
+                pair_matches = (
+                    pair_matches
+                    & subject_class_matches
+                    & object_class_matches
+                )
+            else:
+                # [IoU-only ablation]
+                # ``pair_matches`` already contains the two directed IoU
+                # constraints computed above. Do not add detector-class
+                # agreement here. The SGDet evaluator remains unchanged.
+                assert self.vg_match_mode == "iou_only"
+
             target_predicates = gt_predicates
 
         else:
@@ -1423,6 +1400,28 @@ def get_obj_text_emb(args, clip_model, obj_class_names):
     return object_embedding
 
 
+@torch.no_grad()
+def get_vg_frozen_predicate_emb(clip_model, predicate_names):
+    """Encode one fixed, shared CLIP prototype per VG predicate."""
+    # [VG frozen shared predicate text]
+    # The generic endpoints express that a predicate connects two objects,
+    # while keeping the output table pair-independent as in original LAIN.
+    sentences = [
+        f"a photo of one object {predicate} another object"
+        for predicate in predicate_names
+    ]
+    tokenized = torch.cat([
+        tokenize(sentence)
+        for sentence in sentences
+    ])
+    features = clip_model.encode_text(tokenized)
+    return F.normalize(
+        features.float(),
+        dim=-1,
+        eps=1e-6,
+    )
+
+
 def build_detector(
     args,
     class_corr,
@@ -1434,16 +1433,16 @@ def build_detector(
             raise ValueError(
                 "--egtr-detector-dir is required for VG"
             )
-        # [SGG compositional text]
-        # Learned predicate contexts remain required only for the original
-        # compositional path. Literal-cache mode deliberately bypasses them.
+        # [VG predicate-only text]
+        # Learned predicate contexts feed the frozen CLIP text encoder, whose
+        # normalized outputs are used directly. Literal-cache bypasses them.
         vg_text_mode = getattr(
             args,
             "vg_text_mode",
-            "compositional",
+            "predicate",
         )
         if vg_text_mode in {
-            "compositional",
+            "predicate",
             "online_literal",
         } and not args.use_prompt:
             raise ValueError(
@@ -1469,6 +1468,10 @@ def build_detector(
 
         if (
             getattr(args, "vg_ovr", False)
+            and vg_text_mode in {
+                "predicate",
+                "online_literal",
+            }
             and args.CSC
         ):
             # [VG OvR shared prompt]
@@ -1553,12 +1556,12 @@ def build_detector(
             get_vg_object_names,
         )
 
-        # [SGG compositional text]
+        # [VG predicate-only text]
         # Fully-supervised VG may use the configured class-specific context.
         # VG OvR uses one shared context (CSC=False), learned from base
-        # predicates and reused for novel predicate names. Ordered
-        # subject/object information is injected later by the lightweight
-        # pair composer in both paths.
+        # predicates and reused for novel predicate names. The normalized
+        # CLIP text-encoder output is the final predicate prototype; no
+        # trainable module is applied after it.
         classnames = list(VG150_PREDICATES)
 
     else:
@@ -1576,6 +1579,21 @@ def build_detector(
         )
 
     model = CustomCLIP(args, classnames=classnames, clip_model=clip_model)
+
+    frozen_predicate_embedding = None
+    if args.dataset == "vg" and vg_text_mode == "frozen_predicate":
+        # [VG frozen shared predicate text]
+        # Encode exactly 50 fixed prototypes before training.  No module is
+        # inserted after CLIP; scoring remains visual_features @ text.T.
+        frozen_predicate_embedding = get_vg_frozen_predicate_emb(
+            clip_model,
+            classnames,
+        ).clone().detach()
+
+        # CustomCLIP still constructs PromptLearner for checkpoint/interface
+        # compatibility, but this mode does not use or optimize its context.
+        for parameter in model.prompt_learner.parameters():
+            parameter.requires_grad_(False)
 
     vg_object_names = None
     if args.dataset == "vg":
@@ -1624,6 +1642,7 @@ def build_detector(
             if args.dataset == "vg"
             else None
         ),
+        frozen_predicate_embedding=frozen_predicate_embedding,
     )
 
     return detector
